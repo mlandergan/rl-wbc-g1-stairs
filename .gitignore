@@ -1,0 +1,12 @@
+.claude/
+logs/
+logs_pulled/
+*.tar.gz
+__pycache__/
+*.pyc
+.DS_Store
+node_modules/
+
+# dated investigation doc, code-cited as the source of a real fix but not
+# part of the public/educational scope -- kept local only
+/instinctlab_comparison.md

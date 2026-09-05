@@ -1,0 +1,142 @@
+# Forked from rl-wbc-g1-amp's skrl_g1_amp_cfg.yaml (itself adapted from linden713/humanoid_amp's
+# skrl_g1_walk_amp_cfg.yaml, BSD-3-Clause). PPO hyperparameters (learning rate/schedule, entropy
+# bonus, network shape, rollout length, grad clipping, obs normalization) are already
+# cross-validated against rl-wbc-g1-baseline's rsl_rl config there -- carried over unchanged.
+# task_reward_weight/style_reward_weight = 0.5/0.5 and the 50k-step timesteps floor are that
+# project's own resolved regime (see its binary-search debugging history), not re-derived here.
+
+seed: 42
+
+# Models are instantiated using skrl's model instantiator utility
+# https://skrl.readthedocs.io/en/latest/api/utils/model_instantiators.html
+models:
+  separate: True
+  policy:  # see gaussian_model parameters
+    class: GaussianMixin
+    clip_actions: False
+    clip_log_std: True
+    min_log_std: -20.0
+    max_log_std: 2.0
+    initial_log_std: 0.0  # std=1.0, matches Project 1's init_noise_std=1.0
+    fixed_log_std: False  # learnable, matches rsl_rl's default (Project 1 never fixes this)
+    network:
+      - name: net
+        input: STATES
+        layers: [256, 128, 128]  # matches Project 1's actor_hidden_dims
+        activations: elu  # matches Project 1's activation
+    output: ACTIONS
+  value:  # see deterministic_model parameters
+    class: DeterministicMixin
+    clip_actions: False
+    network:
+      - name: net
+        input: STATES
+        layers: [256, 128, 128]  # matches Project 1's critic_hidden_dims
+        activations: elu
+    output: ONE
+  discriminator:  # see deterministic_model parameters -- no Project 1 equivalent (AMP-only),
+    # matched to the same shape as policy/value anyway to avoid an unnecessary third confound
+    class: DeterministicMixin
+    clip_actions: False
+    network:
+      - name: net
+        input: STATES
+        layers: [256, 128, 128]
+        activations: elu
+    output: ONE
+
+# Rollout memory
+# https://skrl.readthedocs.io/en/latest/api/memories/random.html
+memory:
+  class: RandomMemory
+  memory_size: -1  # automatically determined (same as agent:rollouts)
+
+# AMP memory (reference motion dataset)
+# https://skrl.readthedocs.io/en/latest/api/memories/random.html
+motion_dataset:
+  class: RandomMemory
+  memory_size: 200000
+
+# AMP memory (preventing discriminator overfitting)
+# https://skrl.readthedocs.io/en/latest/api/memories/random.html
+reply_buffer:
+  class: RandomMemory
+  memory_size: 1000000
+
+# AMP agent configuration (field names are from AMP_DEFAULT_CONFIG)
+# https://skrl.readthedocs.io/en/latest/api/agents/amp.html
+agent:
+  class: AMP
+  rollouts: 24  # matches Project 1's num_steps_per_env
+  learning_epochs: 5  # matches Project 1's num_learning_epochs
+  mini_batches: 4  # matches Project 1's num_mini_batches
+  discount_factor: 0.99  # already matched Project 1's gamma
+  lambda: 0.95  # already matched Project 1's lam
+  learning_rate: 0.001  # matches Project 1's learning_rate
+  learning_rate_scheduler: KLAdaptiveLR  # matches Project 1's schedule: adaptive
+  learning_rate_scheduler_kwargs:
+    kl_threshold: 0.01  # matches Project 1's desired_kl
+  # Project 1 uses NO obs/value normalization (actor_obs_normalization/critic_obs_normalization/
+  # empirical_normalization are all off) -- disabled here to match. amp_state_preprocessor is
+  # AMP-only (no Project 1 equivalent either way), left as-is since style_reward_weight=0 makes
+  # it a no-op for this reproduction test regardless.
+  state_preprocessor: null
+  state_preprocessor_kwargs: null
+  value_preprocessor: null
+  value_preprocessor_kwargs: null
+  amp_state_preprocessor: RunningStandardScaler
+  amp_state_preprocessor_kwargs: null
+  random_timesteps: 0
+  learning_starts: 0
+  grad_norm_clip: 1.0  # matches Project 1's max_grad_norm
+  ratio_clip: 0.2  # already matched Project 1's clip_param
+  value_clip: 0.2
+  clip_predicted_values: True  # already matched Project 1's use_clipped_value_loss
+  entropy_loss_scale: 0.008  # matches Project 1's entropy_coef
+  value_loss_scale: 1.0  # matches Project 1's value_loss_coef
+  discriminator_loss_scale: 5.0  # AMP-only, no Project 1 equivalent, left as-is
+  amp_batch_size: 512
+  # 0.5/0.5 task/style split -- rl-wbc-g1-amp's own resolved regime (its binary-search debugging
+  # found the pure-imitation 0.0/1.0 split produces a frozen caricature gait; 0.5/0.5 is the
+  # combined run that actually walked and tracked velocity while getting a style gradient). Carried
+  # over here as the starting point for stairs, not re-derived -- revisit once stairs-specific AMP
+  # reference motion replaces the bootstrap Strut Walking clip (see g1_stairs_env_cfg.py).
+  task_reward_weight: 0.5
+  style_reward_weight: 0.5
+  discriminator_batch_size: 4096
+  discriminator_reward_scale: 2.0
+  discriminator_logit_regularization_scale: 0.05
+  discriminator_gradient_penalty_scale: 5.0
+  discriminator_weight_decay_scale: 1.0e-04
+  time_limit_bootstrap: True  # bootstrap value at episode timeout rather than treating it as
+  # a hard end -- Isaac Lab's rsl_rl wrapper does this for Project 1 by default; without it here,
+  # a *successful* full-length episode gets its final steps' returns truncated the same way a
+  # fall would, which is the wrong signal.
+  # logging and checkpoint
+  experiment:
+    directory: "g1_stairs"
+    experiment_name: ""
+    # write_interval/checkpoint_interval pinned explicitly (2026-08-13) rather than left on "auto"
+    # so TensorBoard scalars update frequently enough for live monitoring and checkpoints/videos
+    # can be spot-checked every 1000 steps across the full run, not just every ~5000 (auto's
+    # convention at 50k timesteps).
+    write_interval: 100
+    checkpoint_interval: 1000
+
+# Sequential trainer
+# https://skrl.readthedocs.io/en/latest/api/trainers/sequential.html
+trainer:
+  class: SequentialTrainer
+  # 50k+-step floor established by this project line's own AMP debugging history (a 10k-step
+  # checkpoint produced occasional falls / unreliable style transfer) -- see
+  # project_description.md's Compute Budget section.
+  #
+  # 2026-08-13: this run resumes from agent_13000.pt (a diagnostic 20k-step run cut short at 65%
+  # to test a since-abandoned in-process --video approach) -- checkpoint video review at step
+  # 13000 showed real goal-reaching (robots on the top platform, not just camping at the base),
+  # confirming the Finding-B AMP-frame fix + dont_wait/stand_still terms are working directionally.
+  # Extended back to the full 50000-step production target, num_envs=4096, no video flags this
+  # time (avoids the --enable_cameras startup stall entirely) -- see
+  # scripts/export_checkpoint_videos.sh for pulling videos post-hoc once this finishes.
+  timesteps: 50000
+  environment_info: log

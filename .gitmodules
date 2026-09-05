@@ -1,0 +1,3 @@
+[submodule "reference/InstinctLab"]
+	path = reference/InstinctLab
+	url = git@github.com:project-instinct/InstinctLab.git
