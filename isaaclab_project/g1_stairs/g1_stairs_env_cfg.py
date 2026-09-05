@@ -41,12 +41,14 @@ terrain-height formula was deliberately designed to not depend on either way.
 from __future__ import annotations
 
 import copy
+import math
 import os
 
 import isaaclab.sim as sim_utils
 from isaaclab.envs import DirectRLEnvCfg
 from isaaclab.scene import InteractiveSceneCfg
-from isaaclab.sensors import ContactSensorCfg
+from isaaclab.sensors import ContactSensorCfg, RayCasterCameraCfg
+from isaaclab.sensors.ray_caster.patterns import PinholeCameraPatternCfg
 from isaaclab.sim import PhysxCfg, SimulationCfg
 from isaaclab.terrains import FlatPatchSamplingCfg, TerrainGeneratorCfg, TerrainImporterCfg
 from isaaclab.terrains.height_field import HfPyramidStairsTerrainCfg
@@ -305,6 +307,62 @@ class G1StairsEnvCfg(DirectRLEnvCfg):
         track_air_time=True,
     )
 
+    # --- Depth camera (WORKING_NOTES.md's "Exact camera configuration" section) ---
+    #
+    # A RayCasterCamera, not a rendered TiledCamera -- raycasts against mesh geometry
+    # (GPU-accelerated via Warp) rather than going through the RTX render pipeline, so this has
+    # no renderer/Vulkan/GL dependency at all. Every numeric parameter below (mount pose, FOV,
+    # raw resolution, crop region, blur/normalize params) is InstinctLab's own published design
+    # choice for this exact robot/task (confirmed from their `parkour_env_cfg.py`, CC BY-NC,
+    # design-reference only -- these are facts about their public research artifact, not code
+    # copied from it; the crop/blur/normalize steps themselves are reimplemented in
+    # g1_stairs_env.py's `_process_depth_image`, not their `Noisy*` sensor classes).
+    DEPTH_RAW_WIDTH = 64
+    DEPTH_RAW_HEIGHT = 36
+    DEPTH_HFOV_DEG = 89.51
+    DEPTH_VFOV_DEG = 58.29
+    DEPTH_RANGE_M = (0.0, 2.5)  # clamp+normalize range fed to the network
+    # (crop_x, crop_y, crop_w, crop_h) into the raw 64x36 image -- InstinctLab's own crop region,
+    # landing on a 16x16 final image (matches DepthAmpPolicy's Conv2d encoder sizing exactly).
+    DEPTH_CROP_REGION = (18, 0, 16, 16)
+    DEPTH_FINAL_SIZE = 16  # == DEPTH_CROP_REGION's (w, h)
+    DEPTH_BLUR_KERNEL_SIZE = 3
+    DEPTH_BLUR_SIGMA = 1.0
+
+    depth_camera: RayCasterCameraCfg = RayCasterCameraCfg(
+        prim_path="/World/envs/env_.*/Robot/torso_link",
+        mesh_prim_paths=["/World/ground"],
+        ray_alignment="yaw",
+        pattern_cfg=PinholeCameraPatternCfg(
+            focal_length=1.0,
+            horizontal_aperture=2 * math.tan(math.radians(DEPTH_HFOV_DEG) / 2),
+            vertical_aperture=2 * math.tan(math.radians(DEPTH_VFOV_DEG) / 2),
+            width=DEPTH_RAW_WIDTH,
+            height=DEPTH_RAW_HEIGHT,
+        ),
+        debug_vis=False,
+        data_types=["distance_to_image_plane"],
+        update_period=0.02,
+        # No `min_distance` field exists on the actually-installed RayCasterCameraCfg/RayCasterCfg
+        # (confirmed 2026-09-05 by reading the real installed source off the training VM -- this
+        # sensor has no near-clipping concept at all, only `max_distance`, unlike a rendered
+        # TiledCamera). Near-range behavior isn't needed here anyway: g1_stairs_env.py's
+        # `_process_depth_image` already clamps everything to DEPTH_RANGE_M in post-processing.
+        # `max_distance` is set to DEPTH_RANGE_M's far bound so `depth_clipping_behavior="max"`
+        # (clip-to-max rather than emit inf/nan past this range) actually has an effect -- its
+        # own default (1e6) would make "max" clipping a no-op in practice.
+        depth_clipping_behavior="max",
+        max_distance=DEPTH_RANGE_M[1],
+        # "G1 Robot head camera nominal pose", per InstinctLab's own comment -- mounted on
+        # torso_link (the nearest rigid body to the head in this robot's kinematic tree) with an
+        # offset/tilt that puts the camera at head height, forward-facing.
+        offset=RayCasterCameraCfg.OffsetCfg(
+            pos=(0.0487988662332928, 0.01, 0.4378029937970051),
+            rot=(0.9135367613482678, 0.004363309284746571, 0.4067366430758002, 0.0),
+            convention="world",
+        ),
+    )
+
     # Position-based, direction-biased velocity command (project_description.md's Command
     # Generation section; paper's Eq. 8-9): v_x = clip(k_v * x_g, 0, v_max),
     # w_z = clip(k_w * atan2(y_g, x_g), -w_max, w_max), where (x_g, y_g) is the goal position
@@ -337,11 +395,19 @@ class G1StairsEnvCfg(DirectRLEnvCfg):
 
     # spaces — 71 task-obs dims (29 dof_pos + 29 dof_vel + 1 root height + 6 tangent/normal
     # + 3 root lin vel + 3 root ang vel) + 3*10 key-body relative positions + 3 velocity command
-    observation_space = 71 + 3 * 10 + 3
+    # + DEPTH_FINAL_SIZE**2 (16x16=256) flattened depth pixels, appended at the end. Flat single
+    # Box observation (not a nested Dict) by design -- see WORKING_NOTES.md's "flat single
+    # policy Box" decision. DepthAmpPolicy/DepthAmpValue (models.py) slice this back apart into
+    # proprio(104) + depth(256) inside their own compute(), the env itself stays obs-space-agnostic
+    # about that split.
+    observation_space = 71 + 3 * 10 + 3 + DEPTH_FINAL_SIZE**2
     action_space = 29
     state_space = 0
     num_amp_observations = 2
-    amp_observation_space = 71 + 3 * 10  # AMP obs stays style-only, no command — see g1_stairs_env.py
+    # AMP obs stays style-only, no command, NO depth image -- confirmed against InstinctLab's own
+    # actual discriminator inputs (WORKING_NOTES.md: AmpPolicyStateObsCfg/AmpReferenceStateObsCfg
+    # are proprioceptive-only; depth_image only ever feeds their policy/value encoders).
+    amp_observation_space = 71 + 3 * 10
 
     # target = default_joint_pos + action_scale * action (JointPositionAction, scale=0.5,
     # use_default_offset=true) -- NOT the original AMP reference implementation's

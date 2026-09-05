@@ -16,6 +16,32 @@ Copyright (c) 2022-2025, The Isaac Lab Project Developers.
 SPDX-License-Identifier: BSD-3-Clause
 ```
 
+## Code adapted/copied directly (not just design reference)
+
+- `isaaclab_project/g1_stairs/agents/wasabi_amp.py`: `WasabiAMP._update()` is
+  `skrl.agents.torch.amp.amp.AMP._update()` (the actually-installed skrl 1.4.3
+  version, not the newer GitHub `main` branch — see the file's own module
+  docstring for why that distinction mattered here)
+  ([`Toni-SM/skrl`](https://github.com/Toni-SM/skrl), MIT-licensed) copied
+  essentially verbatim, with three discriminator-training formulas swapped
+  for [WASABI](https://github.com/martius-lab/wasabi)'s own versions, ported
+  from `instinct_rl/algorithms/wasabi.py`
+  ([`project-instinct/instinct_rl`](https://github.com/project-instinct/instinct_rl),
+  Modified MIT License, copyright Ziwen Zhuang — standard MIT terms plus a UI
+  credit requirement only above 100M monthly users or $20M/month revenue,
+  irrelevant at this project's scale). See `WORKING_NOTES.md` for exactly
+  which three formulas differ and why.
+- `scripts/train_amp_depth.py` is adapted from Isaac Lab's stock
+  `scripts/reinforcement_learning/skrl/train.py`
+  ([`isaac-sim/IsaacLab`](https://github.com/isaac-sim/IsaacLab),
+  BSD-3-Clause) — env construction and Hydra config loading kept as-is,
+  only the agent/model instantiation section was rewritten (see the script's
+  own docstring for why).
+- `isaaclab_project/g1_stairs/models.py`'s `DepthAmpPolicy`/`DepthAmpValue`
+  are original code written for this project, subclassing `skrl`'s
+  `GaussianMixin`/`DeterministicMixin`/`Model` (MIT-licensed) per its
+  documented public extension pattern, not copied from any example.
+
 The following runtime dependencies are installed separately and remain
 subject to their own licenses:
 

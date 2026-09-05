@@ -77,12 +77,13 @@ import re
 import gymnasium as gym
 import numpy as np
 import torch
+import torch.nn.functional as F
 
 import isaaclab.sim as sim_utils
 from isaaclab.assets import Articulation
 from isaaclab.envs import DirectRLEnv
 from isaaclab.markers import VisualizationMarkers, VisualizationMarkersCfg
-from isaaclab.sensors import ContactSensor
+from isaaclab.sensors import ContactSensor, RayCasterCamera
 from isaaclab.terrains import TerrainImporter
 from isaaclab.utils.math import (
     quat_apply,
@@ -125,6 +126,17 @@ class G1StairsEnv(DirectRLEnv):
 
     def __init__(self, cfg: G1StairsEnvCfg, render_mode: str | None = None, **kwargs):
         super().__init__(cfg, render_mode, **kwargs)
+
+        # fixed depth-blur kernel for _process_depth_image, precomputed once (not per-step) --
+        # a standard discretized isotropic Gaussian, matching InstinctLab's own
+        # kernel_size=3/sigma=1 blur parameters (WORKING_NOTES.md). (1, 1, k, k) shape for
+        # torch.nn.functional.conv2d's (out_channels, in_channels/groups, kH, kW) convention.
+        k, sigma = self.cfg.DEPTH_BLUR_KERNEL_SIZE, self.cfg.DEPTH_BLUR_SIGMA
+        coords = torch.arange(k, dtype=torch.float32, device=self.device) - (k - 1) / 2.0
+        gauss_1d = torch.exp(-(coords**2) / (2 * sigma**2))
+        gauss_2d = torch.outer(gauss_1d, gauss_1d)
+        gauss_2d = gauss_2d / gauss_2d.sum()
+        self._depth_blur_kernel = gauss_2d.view(1, 1, k, k)
 
         # load motion
         self._motion_loader = MotionLoader(motion_file=self.cfg.motion_file, device=self.device)
@@ -238,6 +250,15 @@ class G1StairsEnv(DirectRLEnv):
         # g1_stairs_env_cfg.py's feet_contact_sensor comment.
         self.contact_sensor = ContactSensor(self.cfg.feet_contact_sensor)
         self.scene.sensors["feet_contact_sensor"] = self.contact_sensor
+
+        # depth camera (WORKING_NOTES.md's "Exact camera configuration") -- a RayCasterCamera,
+        # so this raycasts against the mesh_prim_paths given in cfg.depth_camera ("/World/ground",
+        # which after clone_environments below resolves per-env) rather than going through the
+        # RTX render pipeline. NOT verified against a real Isaac Lab install -- first thing to
+        # check on the next GPU-VM session if _process_depth_image ever sees an all-zero/all-inf
+        # image (see that method's own docstring for the specific output-shape assumption at risk).
+        self.depth_camera = RayCasterCamera(self.cfg.depth_camera)
+        self.scene.sensors["depth_camera"] = self.depth_camera
 
         self.scene.clone_environments(copy_from_source=False)
         self.scene.articulations["robot"] = self.robot
@@ -396,10 +417,57 @@ class G1StairsEnv(DirectRLEnv):
         # reaches the trainer's info dict (confirmed: this is exactly what was happening).
         self.extras["amp_obs"] = self.amp_observation_buffer.view(-1, self.amp_observation_size)
 
-        # policy observation = style obs + velocity command, so the policy can condition its
-        # actions on what it's being asked to do (the discriminator above never sees this)
-        policy_obs = torch.cat((amp_obs, self.commands), dim=-1)
+        # policy observation = style obs + velocity command + flattened depth image, so the
+        # policy can condition its actions on both what it's being asked to do AND what's ahead
+        # of it. The discriminator above never sees the command OR the depth image -- confirmed
+        # against InstinctLab's own actual discriminator inputs (WORKING_NOTES.md), it judges
+        # motion style only. Flat concatenation, not a nested Dict -- DepthAmpPolicy/DepthAmpValue
+        # (models.py) slice this back apart in their own compute() (see WORKING_NOTES.md's "flat
+        # single policy Box" decision).
+        depth_obs = self._process_depth_image().view(self.num_envs, -1)
+        policy_obs = torch.cat((amp_obs, self.commands, depth_obs), dim=-1)
         return {"policy": policy_obs}
+
+    def _process_depth_image(self) -> torch.Tensor:
+        """Crop/blur/normalize the raw depth camera output into the (N, 16, 16) tensor
+        DepthAmpPolicy/DepthAmpValue's Conv2d branch expects -- InstinctLab's own exact
+        crop/blur/normalize parameters (WORKING_NOTES.md), reimplemented directly here rather
+        than importing their `Noisy*` sensor classes (their own CC BY-NC source).
+
+        NOT verified against a real Isaac Lab install -- specifically the assumption that
+        `self.depth_camera.data.output["distance_to_image_plane"]` has shape
+        (N, height, width, 1), matching Isaac Lab's other camera sensor classes'
+        documented convention (confirmed for TiledCamera via Isaac Lab's own stock
+        Cartpole-Depth-Camera example; RayCasterCamera specifically not independently
+        confirmed). If this is actually (N, height, width) with no trailing channel dim, the
+        `squeeze(-1)` below is a no-op and this still works either way -- but if the height/width
+        axis order is swapped, the crop below silently reads the wrong region rather than
+        erroring. First thing to check on the next GPU-VM session (log `.shape` once).
+        """
+        cfg = self.cfg
+        raw = self.depth_camera.data.output["distance_to_image_plane"]  # (N, H, W[, 1])
+        if raw.dim() == 4:
+            raw = raw.squeeze(-1)  # (N, H, W)
+
+        # depth_clipping_behavior="max" should already clamp out-of-range rays, but defensively
+        # replace any NaN/inf before cropping/blurring, so a single bad ray can't propagate into
+        # the whole blurred neighborhood.
+        raw = torch.nan_to_num(raw, nan=cfg.DEPTH_RANGE_M[1], posinf=cfg.DEPTH_RANGE_M[1], neginf=cfg.DEPTH_RANGE_M[0])
+
+        crop_x, crop_y, crop_w, crop_h = cfg.DEPTH_CROP_REGION
+        cropped = raw[:, crop_y : crop_y + crop_h, crop_x : crop_x + crop_w]  # (N, 16, 16)
+
+        # Gaussian blur via a fixed, precomputed small kernel (no torchvision dependency) --
+        # separable would be cheaper, but at 16x16 a single small conv2d is already trivial.
+        blurred = F.conv2d(
+            cropped.unsqueeze(1),  # (N, 1, 16, 16)
+            self._depth_blur_kernel,
+            padding=cfg.DEPTH_BLUR_KERNEL_SIZE // 2,
+        ).squeeze(1)  # (N, 16, 16)
+
+        clamped = torch.clamp(blurred, cfg.DEPTH_RANGE_M[0], cfg.DEPTH_RANGE_M[1])
+        normalized = (clamped - cfg.DEPTH_RANGE_M[0]) / (cfg.DEPTH_RANGE_M[1] - cfg.DEPTH_RANGE_M[0])
+        return normalized
 
     def _get_rewards(self) -> torch.Tensor:
         # self.commands must reflect THIS step's post-physics robot pose before either the task

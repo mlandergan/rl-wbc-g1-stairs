@@ -10,3 +10,7 @@ node_modules/
 # dated investigation doc, code-cited as the source of a real fix but not
 # part of the public/educational scope -- kept local only
 /instinctlab_comparison.md
+
+# scratch validation renders (start-pose screenshot, motion-at-spawn video) --
+# throwaway visual checks, not curated deliverables
+/output/
