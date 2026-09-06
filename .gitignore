@@ -7,9 +7,14 @@ __pycache__/
 .DS_Store
 node_modules/
 
-# dated investigation doc, code-cited as the source of a real fix but not
-# part of the public/educational scope -- kept local only
+# dated investigation docs and working notes: real sources for the code, but narrative
+# rather than public/educational scope -- kept local only
 /instinctlab_comparison.md
+/instinctlab_vs_g1stairs_audit.md
+/WORKING_NOTES.md
+
+# local diagnostic scripts (one-off GPU-VM checks, not part of the shipped pipeline)
+/scripts/_verify_*.py
 
 # scratch validation renders (start-pose screenshot, motion-at-spawn video) --
 # throwaway visual checks, not curated deliverables

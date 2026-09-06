@@ -3,7 +3,7 @@
 # sibling of train_amp.sh that uses scripts/train_amp_depth.py (a project-owned training entry
 # point) instead of Isaac Lab's stock scripts/reinforcement_learning/skrl/train.py, since that
 # stock script can't construct a custom agent/model class (see train_amp_depth.py's own
-# docstring, and WORKING_NOTES.md's "Decisive constraint found" section, for why).
+# docstring for why).
 #
 # Run on the GCP VM after scripts/remote_setup.sh has built `rl-wbc-g1-stairs`. Mounts ./logs
 # so checkpoints/TensorBoard logs survive container exit (scripts/sync_results.sh pulls them

@@ -1,5 +1,5 @@
 """WasabiAMP: skrl's own `AMP` agent, with three formula swaps to match WASABI's exact
-discriminator training (WORKING_NOTES.md's comparison table), ported from
+discriminator training, ported from
 `instinct_rl/algorithms/wasabi.py` (MIT-licensed, copyright Ziwen Zhuang -- see
 THIRD_PARTY_NOTICES.md) rather than reimplemented from scratch.
 
@@ -51,7 +51,7 @@ from skrl.resources.schedulers.torch import KLAdaptiveLR
 
 class WasabiAMP(AMP):
     """See module docstring. `cfg` is a plain dict, same as the base `AMP` class -- pass
-    `discriminator_gradient_tolerance` as an extra key in it (WORKING_NOTES.md: WASABI's own
+    `discriminator_gradient_tolerance` as an extra key in it (WASABI's own
     default is 0.0, InstinctLab's parkour config didn't override it either) if you want anything
     other than the 0.0 fallback used below.
     """

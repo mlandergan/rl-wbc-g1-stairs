@@ -67,7 +67,7 @@ from isaaclab.utils.dict import print_dict
 from isaaclab.utils.io import dump_yaml
 from isaaclab_rl.skrl import SkrlVecEnvWrapper
 
-import isaaclab_project.g1_stairs  # noqa: F401 -- gym.register side effect
+import isaaclab_project.g1_stairs
 from isaaclab_tasks.utils.hydra import hydra_task_config
 
 from skrl.memories.torch import RandomMemory
@@ -90,11 +90,8 @@ def main(env_cfg: DirectRLEnvCfg, agent_cfg: dict):
     seed = args_cli.seed if args_cli.seed is not None else agent_cfg.get("seed", 42)
     env_cfg.seed = seed
 
-    a = agent_cfg["agent"]  # shorthand -- the yaml's `agent:` block, field names match skrl
-    # 1.4.3's real AMP_DEFAULT_CONFIG dict keys (see skrl_g1_stairs_cfg.yaml's 2026-09-05 note)
+    a = agent_cfg["agent"]
 
-    # logging directory, same convention as the stock train.py so this project's existing
-    # scripts/watch_training_videos.py / export_checkpoint_videos.sh keep working unchanged
     log_root_path = os.path.abspath(os.path.join("logs", "skrl", a["experiment"]["directory"]))
     print(f"[INFO] Logging experiment in directory: {log_root_path}")
     log_dir = datetime.now().strftime("%Y-%m-%d_%H-%M-%S") + "_wasabi_amp_depth"
@@ -106,23 +103,12 @@ def main(env_cfg: DirectRLEnvCfg, agent_cfg: dict):
     dump_yaml(os.path.join(log_dir, "params", "env.yaml"), env_cfg)
     dump_yaml(os.path.join(log_dir, "params", "agent.yaml"), agent_cfg)
 
-    # create isaac environment
     env = gym.make(args_cli.task, cfg=env_cfg, render_mode=None)
     env = SkrlVecEnvWrapper(env)
     device = env.device
 
     print_dict({"task": args_cli.task, "num_envs": env.num_envs, "device": device}, nesting=1)
 
-    # --- models ---
-    # policy/value: custom multi-modal (proprio + depth-CNN) classes, models.py -- see that
-    # file's docstring for why these can't be expressed via skrl's YAML instantiator.
-    # discriminator: unchanged shape from the original yaml (models.discriminator.network),
-    # built via skrl's own deterministic_model utility rather than hand-written, since nothing
-    # about it changed. input="OBSERVATIONS" is a pure alias for "STATES" in skrl's model-
-    # instantiator DSL (confirmed in the installed source, utils/model_instantiators/torch/
-    # common.py's _parse_input: both string-replace to the same `inputs["states"]` access) --
-    # matches how WasabiAMP._update() (copied from the real, installed skrl AMP._update()) calls
-    # it: self.discriminator.act({"states": ...}, ...).
     models = {
         "policy": DepthAmpPolicy(
             observation_space=env.observation_space,
@@ -144,19 +130,10 @@ def main(env_cfg: DirectRLEnvCfg, agent_cfg: dict):
         ),
     }
 
-    # --- memories ---
     memory = RandomMemory(memory_size=a["rollouts"], num_envs=env.num_envs, device=device)
     motion_dataset = RandomMemory(memory_size=agent_cfg["motion_dataset"]["memory_size"], device=device)
     reply_buffer = RandomMemory(memory_size=agent_cfg["reply_buffer"]["memory_size"], device=device)
 
-    # --- agent config ---
-    # Plain dict matching skrl 1.4.3's real AMP_DEFAULT_CONFIG keys (WasabiAMP.__init__ is
-    # inherited unchanged from AMP.__init__, which does
-    # `_cfg = copy.deepcopy(AMP_DEFAULT_CONFIG); _cfg.update(cfg)` -- so this only needs to carry
-    # the keys we want to override, not every key AMP_DEFAULT_CONFIG defines. The one
-    # WASABI-specific extra key (discriminator_gradient_tolerance) isn't in AMP_DEFAULT_CONFIG at
-    # all -- dict.update() happily adds it as a new key, and WasabiAMP._update() reads it back via
-    # self.cfg.get("discriminator_gradient_tolerance", 0.0), so no CFG subclass is needed for it.
     cfg = {
         "rollouts": a["rollouts"],
         "learning_epochs": a["learning_epochs"],
@@ -187,13 +164,8 @@ def main(env_cfg: DirectRLEnvCfg, agent_cfg: dict):
         "discriminator_logit_regularization_scale": a["discriminator_logit_regularization_scale"],
         "discriminator_gradient_penalty_scale": a["discriminator_gradient_penalty_scale"],
         "discriminator_weight_decay_scale": a["discriminator_weight_decay_scale"],
-        "discriminator_gradient_tolerance": a["discriminator_gradient_tolerance"],  # WASABI-only,
-        # see comment above -- not a real AMP_DEFAULT_CONFIG key.
+        "discriminator_gradient_tolerance": a["discriminator_gradient_tolerance"],
         "time_limit_bootstrap": a["time_limit_bootstrap"],
-        # NOTE: `AMP.__init__` merges this whole dict into AMP_DEFAULT_CONFIG via a plain (shallow)
-        # `dict.update()` -- a partial "experiment" sub-dict here would silently REPLACE, not
-        # merge with, AMP_DEFAULT_CONFIG's own "experiment" defaults, dropping
-        # store_separately/wandb/wandb_kwargs. Spelled out in full here to avoid that.
         "experiment": {
             "directory": log_root_path,
             "experiment_name": os.path.basename(log_dir),
@@ -205,9 +177,6 @@ def main(env_cfg: DirectRLEnvCfg, agent_cfg: dict):
         },
     }
 
-    # collect_reference_motions is defined directly on G1StairsEnv (g1_stairs_env.py) -- reach
-    # through the SkrlVecEnvWrapper via .unwrapped rather than assume the wrapper forwards
-    # arbitrary custom attributes.
     agent = WasabiAMP(
         models=models,
         memory=memory,
@@ -227,7 +196,12 @@ def main(env_cfg: DirectRLEnvCfg, agent_cfg: dict):
 
     timesteps = args_cli.max_iterations * a["rollouts"] if args_cli.max_iterations else agent_cfg["trainer"]["timesteps"]
     trainer = SequentialTrainer(
-        cfg={"timesteps": timesteps, "headless": args_cli.headless, "close_environment_at_exit": False},
+        cfg={
+            "timesteps": timesteps,
+            "headless": args_cli.headless,
+            "close_environment_at_exit": False,
+            "environment_info": "log",
+        },
         env=env,
         agents=agent,
     )

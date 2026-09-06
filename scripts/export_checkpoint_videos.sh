@@ -14,6 +14,9 @@
 # RUN_DIR defaults to the most recently modified logs/skrl/g1_stairs/*_ppo_torch directory.
 set -euo pipefail
 
+NUM_ENVS="${NUM_ENVS:-4}"      # play_amp_depth.py's own default; fewer robots = clearer video
+VIDEO_LENGTH="${VIDEO_LENGTH:-200}"
+
 RUN_DIR="${1:-$(find "$(pwd)/logs/skrl/g1_stairs" -maxdepth 1 -type d -name '*_ppo_torch' | sort | tail -1)}"
 CKPT_DIR="${RUN_DIR}/checkpoints"
 
@@ -32,17 +35,22 @@ for ckpt in "${CKPT_DIR}"/*.pt; do
   rel_path="${ckpt#"$(pwd)"/logs/}"
   container_ckpt="/workspace/isaaclab_root/logs/${rel_path}"
 
+  # FIXED 2026-09-06: this called Isaac Lab's STOCK scripts/reinforcement_learning/skrl/play.py,
+  # which cannot construct this project's custom DepthAmpPolicy/DepthAmpValue models (the same
+  # constraint that forced train_amp_depth.py to exist instead of the stock train.py -- see that
+  # file's docstring). It also never mounted scripts/, so the project's own play script would not
+  # have been visible inside the container even if it had been named. Both fixed here.
   sudo docker run --rm --gpus all \
     -e ACCEPT_EULA=Y \
     -v "$(pwd)/isaaclab_project:/workspace/rl_wbc_g1/isaaclab_project" \
+    -v "$(pwd)/scripts:/workspace/rl_wbc_g1/scripts" \
     -v "$(pwd)/logs:/workspace/isaaclab_root/logs" \
     rl-wbc-g1-stairs \
     bash -lc "
       cd /workspace/isaaclab_root
-      ./isaaclab.sh -p scripts/reinforcement_learning/skrl/play.py \
-        --task Isaac-G1-AMP-Stairs-Direct-Play-v0 --num_envs 8 \
+      ./isaaclab.sh -p /workspace/rl_wbc_g1/scripts/play_amp_depth.py \
         --checkpoint '${container_ckpt}' \
-        --headless --video --video_length 200 --enable_cameras
+        --num_envs ${NUM_ENVS} --video_length ${VIDEO_LENGTH} --headless
     " > "/tmp/export_${name}.log" 2>&1 \
     && echo "  done -> logs/skrl/g1_stairs/$(basename "${RUN_DIR}")/videos/play/" \
     || echo "  FAILED -- see /tmp/export_${name}.log"
