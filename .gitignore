@@ -16,6 +16,20 @@ node_modules/
 # local diagnostic scripts (one-off GPU-VM checks, not part of the shipped pipeline)
 /scripts/_verify_*.py
 
+# design spec: internal planning doc, superseded by the README for public purposes
+/project_description.md
+
+# scratch media: development frame grabs, setup-verification clips, and eval videos that
+# predate or do not show the behaviour their names suggest. AMP_data keeps only the reference
+# motion and the two tools that preview it.
+/AMP_data/climbing_highlight.mp4
+/AMP_data/final_checkpoint_50000.mp4
+/AMP_data/stairs_verify_results/
+/AMP_data/track_frame_*.png
+/AMP_data/final_frame_*.png
+/AMP_data/lateclip_*.png
+/AMP_data/endcheck_*.png
+
 # scratch validation renders (start-pose screenshot, motion-at-spawn video) --
 # throwaway visual checks, not curated deliverables
 /output/

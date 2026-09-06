@@ -7,8 +7,7 @@
 # TASK options:
 #   Isaac-G1-AMP-Stairs-Direct-v0   (this project's task: velocity tracking + AMP style reward
 #                                    for stair climbing. Still bootstrapped against rl-wbc-g1-amp's
-#                                    Mixamo Strut Walking clip -- stairs-specific reference motion
-#                                    is a separate open task, see project_description.md)
+#                                    climbing reference clip, see motions/)
 set -euo pipefail
 
 TASK="${TASK:-Isaac-G1-AMP-Stairs-Direct-v0}"

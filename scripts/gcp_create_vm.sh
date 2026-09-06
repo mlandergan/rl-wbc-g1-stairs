@@ -2,7 +2,7 @@
 # Create the GCP GPU VM this project line has actually validated AMP training on:
 # g2-standard-4 + one L4 (NOT n1-standard-8 + T4 -- Isaac Sim's docs list the T4 shape as the
 # documented minimum, but every real training run in this project line (rl-wbc-g1-amp,
-# rl-wbc-g1-amp-force) ran on g2-standard-4+L4 instead; see project_description.md's Compute
+# rl-wbc-g1-amp-force) ran on g2-standard-4+L4 instead; see the Compute
 # Budget section). Standard (on-demand) by default -- set SPOT=true for a cheaper, preemptible
 # VM instead. Verify current GCP pricing yourself before a long run.
 #

@@ -12,7 +12,7 @@ Usage:
     python render_parkour_npz_mp4.py \
         --npz parkour_motion_without_run_retargetted.npz \
         --mjcf ../../rl-wbc-g1-amp/third_party/gmr/assets/unitree_g1/g1_mocap_29dof.xml \
-        --start 900 --end 2975 --out climbing_highlight.mp4
+        --start 900 --end 2975 --out reference_preview.mp4
 
     # list detected clip segments sorted by base-height range (climbing candidates first)
     python render_parkour_npz_mp4.py --npz parkour_motion_without_run_retargetted.npz --list-segments
