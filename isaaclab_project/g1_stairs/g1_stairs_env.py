@@ -112,6 +112,10 @@ class G1StairsEnv(DirectRLEnv):
         self.motion_key_body_indexes = self._motion_loader.get_body_index(key_body_names)
 
         feet_body_names = ["right_ankle_roll_link", "left_ankle_roll_link"]
+        # Feet in the MOTION file's own body ordering (distinct from the robot's, like every other
+        # index pair here). Used by _reset_strategy_random to place the robot by its feet rather
+        # than by the clip's absolute height -- see that method for why that distinction matters.
+        self.motion_feet_body_indexes = self._motion_loader.get_body_index(feet_body_names)
         self.feet_body_indexes = [self.robot.data.body_names.index(name) for name in feet_body_names]
         self.feet_contact_body_indexes = [self.contact_sensor.body_names.index(name) for name in feet_body_names]
 
@@ -780,8 +784,29 @@ class G1StairsEnv(DirectRLEnv):
 
         motion_torso_index = self._motion_loader.get_body_index(["pelvis"])[0]
         root_state = self.robot.data.default_root_state[env_ids].clone()
-        root_state[:, 0:3] = body_positions[:, motion_torso_index] + self._sample_border_spawn_positions(env_ids)
-        root_state[:, 2] += 0.02
+        spawn = self._sample_border_spawn_positions(env_ids)
+
+        # Place the robot by its FEET, not by the clip's absolute world pose.
+        #
+        # This used to add the clip's absolute pelvis position straight onto the spawn point,
+        # which was survivable only because the old reference was a flat-ground walk whose pelvis
+        # height barely moved. The climbing clip ascends 0.625 m, so its absolute pelvis height
+        # ranges 0.777 -> 1.402 m: sampling a mid-climb frame spawned the robot with its feet up
+        # to 0.776 m in the air above flat ground, and it simply fell. Measured on the clip,
+        # 98.8% of frames spawned the feet more than 5 cm off the ground, and the resulting
+        # free-fall time (~20 control steps) matched the observed 22.5-step mean episode length.
+        #
+        # Pelvis-above-own-feet is the quantity that actually transfers between the clip's terrain
+        # and ours: it spans just 0.614-0.749 m across the whole clip, where absolute height spans
+        # 0.625 m of pure terrain offset that means nothing once the robot is somewhere else.
+        clip_foot_z = body_positions[:, self.motion_feet_body_indexes, 2].min(dim=1).values
+        pelvis_above_feet = body_positions[:, motion_torso_index, 2] - clip_foot_z
+
+        # x/y come from the spawn point alone. The clip's own translation (up to 2.53 m radially)
+        # used to be added on top, which is larger than the 2.25 m spawn radius itself and could
+        # throw the robot onto the stairs or clean off the 4.99 m tile.
+        root_state[:, 0:2] = spawn[:, 0:2]
+        root_state[:, 2] = spawn[:, 2] + pelvis_above_feet + 0.02
 
         clip_root_rot = body_rotations[:, motion_torso_index]
         clip_lin_vel = body_linear_velocities[:, motion_torso_index]
