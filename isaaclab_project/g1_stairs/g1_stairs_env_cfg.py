@@ -294,7 +294,20 @@ class G1StairsEnvCfg(DirectRLEnvCfg):
     tasks/parkour/mdp/terminations.py:44-51)."""
 
     termination_bad_orientation_rad = 1.0
-    termination_contact_body_names = ["torso_link"]
+    # "pelvis", not "torso_link". InstinctLab's equivalent term is literally named `base_contact`
+    # and is written against a TORSO-ROOTED asset (G1_29DOF_TORSOBASE_POPSICLE_CFG), where
+    # torso_link IS the base -- so it means "the base hit something". This project uses Isaac
+    # Lab's pelvis-rooted G1_29DOF_CFG, where torso_link is a different, higher link, so porting
+    # the literal name instead of the semantic role produced a termination that could never fire:
+    # measured exactly 0.0000 across 332 iterations and ~30M env-steps, while the same contact
+    # sensor drove rew_undesired_contacts at -0.03..-0.08 throughout (so the sensor was fine).
+    #
+    # Expect this to stay rare even when correct: pelvis contact implies ~0.1 m root height, and
+    # the 0.5 m terrain-relative height check trips first in an ordinary fall. It is a redundant
+    # safety net for poses the height check misses (e.g. sitting onto a stair edge), not the
+    # primary fall detector. To make it a real crash detector, widen it to the bodies that should
+    # never touch -- knees, elbows, hands, torso -- rather than the base alone.
+    termination_contact_body_names = ["pelvis"]
     termination_contact_threshold_n = 1.0
 
     terrain_curriculum_lin_vel_threshold = (0.3, 0.6)
