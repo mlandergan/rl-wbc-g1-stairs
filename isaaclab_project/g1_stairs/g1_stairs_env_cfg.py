@@ -94,7 +94,12 @@ _G1_29DOF_SOFT_ARMS_CFG.spawn.activate_contact_sensors = True
 # DelayedPDActuator is an EXPLICIT actuator model where the stock G1 config uses implicit PhysX
 # PD. Same gains either way (as InstinctLab does it), but the dynamics are not identical -- set
 # this False first if a run is unstable in a way nothing else explains.
-ENABLE_ACTUATOR_DELAY = True
+# DISABLED 2026-09-08 for a termination-diagnostic run: a 4090 run reported episodes lasting
+# ~3 s even at 6k iterations, which is exactly the "unstable in a way nothing else explains"
+# case this flag's own comment says to rule out first. Explicit/implicit actuator models do not
+# produce identical dynamics, so it is isolated here rather than left confounded with the
+# termination logic under investigation. Re-enable once episode length is understood.
+ENABLE_ACTUATOR_DELAY = False
 ACTUATOR_MIN_DELAY_STEPS = 0
 ACTUATOR_MAX_DELAY_STEPS = 1
 

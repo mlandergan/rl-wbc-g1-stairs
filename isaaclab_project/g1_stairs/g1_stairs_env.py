@@ -164,6 +164,10 @@ class G1StairsEnv(DirectRLEnv):
 
         self._track_score_sum = torch.zeros(self.num_envs, device=self.device)
 
+        # Per-cause termination diagnostics, populated by _get_dones and logged by _get_rewards.
+        # Initialized here because _get_rewards can run before _get_dones has ever filled it.
+        self._term_cause: dict[str, torch.Tensor] = {}
+
         self._randomize_material_properties()
         self._log_terrain_geometry()
 
@@ -624,6 +628,7 @@ class G1StairsEnv(DirectRLEnv):
             self.goal_pos_w[:, :2] - self.robot.data.root_pos_w[:, :2], dim=-1
         ).mean()
 
+        reward_log.update(self._term_cause)
         self.extras["log"] = reward_log
         return total_reward
 
@@ -632,23 +637,36 @@ class G1StairsEnv(DirectRLEnv):
         if not self.cfg.early_termination:
             return torch.zeros_like(time_out), time_out
 
+        base_terrain_h = self._base_terrain_height()
         root_height_above_terrain = (
-            self.robot.data.body_pos_w[:, self.ref_body_index, 2] - self._base_terrain_height()
+            self.robot.data.body_pos_w[:, self.ref_body_index, 2] - base_terrain_h
         )
-        died = root_height_above_terrain < self.cfg.termination_height
+        died_height = root_height_above_terrain < self.cfg.termination_height
 
         tilt = torch.acos(torch.clamp(-self.robot.data.projected_gravity_b[:, 2], -1.0, 1.0))
-        died = died | (tilt > self.cfg.termination_bad_orientation_rad)
+        died_tilt = tilt > self.cfg.termination_bad_orientation_rad
 
         torso_forces = self.body_contact_sensor.data.net_forces_w_history[
             :, :, self.termination_contact_body_indexes
         ]
-        torso_contact = torch.max(
+        died_contact = torch.max(
             torch.norm(torso_forces, dim=-1).flatten(start_dim=1), dim=1
         )[0] > self.cfg.termination_contact_threshold_n
-        died = died | torso_contact
 
-        return died, time_out
+        # Stashed for _get_rewards to log. Without a per-cause breakdown, a run that dies early
+        # only tells you THAT it died -- these say which of the three conditions actually fired,
+        # plus the raw quantities behind them, so a mis-scaled scanner or a bad sign convention is
+        # distinguishable from the robot genuinely falling over.
+        self._term_cause = {
+            "diag_term_height": died_height.float().mean(),
+            "diag_term_tilt": died_tilt.float().mean(),
+            "diag_term_contact": died_contact.float().mean(),
+            "diag_root_height_above_terrain": root_height_above_terrain.mean(),
+            "diag_base_terrain_height": base_terrain_h.mean(),
+            "diag_tilt_rad": tilt.mean(),
+        }
+
+        return died_height | died_tilt | died_contact, time_out
 
     def _reset_idx(self, env_ids: torch.Tensor | None):
         if env_ids is None or len(env_ids) == self.num_envs:

@@ -112,7 +112,9 @@ agent:
     directory: "g1_stairs"
     experiment_name: ""
     write_interval: 100
-    checkpoint_interval: 20000
+    # 2400 timesteps = 100 PPO iterations at rollouts:24 -- a checkpoint (and therefore a video)
+    # every 100 iterations for the 2026-09-08 diagnostic run.
+    checkpoint_interval: 2400
 
 trainer:
   class: SequentialTrainer
