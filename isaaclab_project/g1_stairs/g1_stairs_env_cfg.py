@@ -61,6 +61,32 @@ STAIRS_TREAD_DEPTH_ACTUAL_M = (
     round(_STAIRS_TREAD_DEPTH_M / _STAIRS_HORIZONTAL_SCALE_M) * _STAIRS_HORIZONTAL_SCALE_M
 )
 
+# True stair geometry, read off isaaclab.terrains.trimesh.mesh_terrains.pyramid_stairs_terrain
+# rather than assumed. Three facts that the quantized constant above gets wrong, and that the
+# volume-point edge penalty needs exactly right:
+#
+#   1. `horizontal_scale` does NOT quantize this terrain. It applies when a heightfield is
+#      converted to a mesh; MeshPyramidStairsTerrainCfg builds trimesh boxes directly from
+#      `step_width`, so the real tread is _STAIRS_TREAD_DEPTH_M (0.2794), not 0.30. The rounded
+#      constant above drifts by 2.06 cm per step -- 10.3 cm by the outermost riser, which is 2x
+#      the 5 cm safety margin, so it names edge lines that are not where the mesh actually is.
+#   2. The generator's step count is `(size - 2*border - platform) // (2*step_width) + 1`, which
+#      for this configuration is 5 -- and 5 is what makes the generated centre platform come out
+#      at exactly the requested 1.2 m. (A 2026-09-08 note in the working log inferred 6 from
+#      averaged env-origin heights; the generator source settles it at 5. The averaged heights
+#      also fit 5 once per-tile difficulty randomness is accounted for: origin_z / 6 lands inside
+#      each row's own difficulty band, which origin_z / 7 does not.)
+#   3. The generator ends with `origin = [cx, cy, (num_steps + 1) * step_height]`, so the platform
+#      height IS (num_steps + 1) step heights. That identity is what lets the env recover each
+#      tile's own step height at runtime as `env_origins_z / (num_steps + 1)` -- exact per tile,
+#      and immune to how `difficulty` was sampled for that tile.
+STAIRS_TREAD_DEPTH_TRUE_M = _STAIRS_TREAD_DEPTH_M
+STAIRS_GENERATOR_NUM_STEPS = int(
+    (_STAIRS_TILE_SIZE_M - 2.0 * _STAIRS_BORDER_WIDTH_M - _STAIRS_PLATFORM_WIDTH_M)
+    // (2.0 * _STAIRS_TREAD_DEPTH_M)
+    + 1
+)
+
 STAIRS_TERRAIN_CFG = TerrainGeneratorCfg(
     size=(_STAIRS_TILE_SIZE_M, _STAIRS_TILE_SIZE_M),
     border_width=2.0,
@@ -139,6 +165,18 @@ class G1StairsEnvCfg(DirectRLEnvCfg):
     rew_joint_acc_l2 = -1.25e-7
     rew_dof_torques_l2 = -1.5e-7
     rew_flat_orientation_l2 = -3.0
+    # World-frame torso-link orientation penalty, ported from InstinctLab's parkour config, which
+    # has BOTH `flat_orientation_l2` (weight -3.0, on its root -- and its asset is torso-rooted,
+    # so that term IS the torso) AND `pelvis_orientation_l2` (weight -3.0, an explicit
+    # link_orientation on "pelvis"). This project's asset is pelvis-rooted, so `rew_flat_orientation_l2`
+    # above already covers the pelvis; this term adds back the torso coverage InstinctLab has and
+    # we were missing. `rew_joint_deviation_torso` (-0.004) only penalizes the waist JOINTS leaving
+    # their default angle -- ~750x weaker, and blind to a torso that is non-vertical in the world
+    # because the pelvis itself pitched. Same class of port gap as the torso_link vs pelvis
+    # contact-termination bug: InstinctLab's term lands on "torso" only because its robot is
+    # torso-rooted. Same formula as flat_orientation (squared xy of gravity projected into the
+    # link frame); see _get_rewards.
+    rew_torso_orientation_l2 = -3.0
     rew_lin_vel_z_l2 = -0.2
     rew_ang_vel_xy_l2 = -0.05
     rew_joint_deviation_hip = -0.5
@@ -170,13 +208,65 @@ class G1StairsEnvCfg(DirectRLEnvCfg):
     rew_edge_penetration = -4.0
     edge_safety_margin_m = 0.05
 
+    # --- Volume-point edge penalty (ablation arm; OFF by default) ---------------------------
+    # Higher-fidelity replacement for `rew_edge_penetration` above, following InstinctLab's
+    # `volume_points_penetration`. The term above models each foot as ONE point (the ankle body
+    # origin) and measures only planar distance to a riser line, so it cannot tell a foot resting
+    # flat on a tread from one hanging half off the edge, and it fires on a foot swinging well
+    # above or below the edge it happens to be over. This models each foot as a grid of points
+    # spanning the real foot volume and measures true 3D distance to the edge, so penetration is
+    # a geometric fact rather than a planar proxy.
+    #
+    # Exclusive with `rew_edge_penetration`: whichever is selected is the only edge term applied,
+    # so the two never double-count. Flip this flag to switch ablation arms.
+    use_volume_points_edge_penalty: bool = False
+    rew_volume_points_penetration = -4.0  # same weight InstinctLab gives the term it ports from
+
+    # Foot-local sample grid, in the `*_ankle_roll_link` frame. Extents are InstinctLab's, which
+    # transfer directly here because both projects drive the same G1 29-DOF asset and the same
+    # ankle_roll_link body -- unlike the torso_link/pelvis mismatch that broke the contact
+    # termination, this link means the same thing on both robots. x spans heel (-2.5 cm) to toe
+    # (+12 cm), y the 6 cm width, z the 4 cm sole depth below the ankle frame.
+    volume_points_x_range_m = (-0.025, 0.12)
+    volume_points_y_range_m = (-0.03, 0.03)
+    volume_points_z_range_m = (-0.04, 0.0)
+    volume_points_grid = (10, 5, 2)  # -> 100 points per foot, 200 per robot
+
+    # Radius of the virtual cylinder wrapped around each stair edge. InstinctLab detects edges by
+    # scanning the terrain mesh (DBSCAN + RANSAC over Canny-detected depth/normal edges) because
+    # its terrains are arbitrary; this project generates its own stairs, so the edges are known in
+    # closed form and no detection is needed -- see _stair_edge_penetration_depth.
+    edge_cylinder_radius_m = 0.05
+
     rew_dont_wait = -0.5
     dont_wait_cmd_threshold_mps = 0.3
     rew_stand_still = -0.3
     stand_still_offset = 4.0
     stand_still_cmd_threshold = 0.15
 
+    # Instantaneous height-above-goal term (root_z - platform_z). Left OFF (0.0): it rewards being
+    # tall at every step regardless of whether height was gained by climbing, so it can be farmed
+    # by jumping or standing on tiptoe, and its baseline gets more negative as the curriculum
+    # raises the goal. rew_height_progress below is the one that's on.
     rew_max_height = 0.0
+
+    # Height-progress reward -- NOT in InstinctLab (whose task reward is pure velocity-command
+    # tracking + is_alive, with climb progress left entirely to the goal-directed command and the
+    # terrain curriculum). Added here to attack the observed plateau: the policy peaked at terrain
+    # level 7.4 then settled ~6, i.e. it CAN climb the hard risers but not reliably, and nothing
+    # in the reward directly pays for height gained. This term pays only for NEW maximum root
+    # height above the episode's spawn height -- so it sums, per episode, to (weight * total
+    # height climbed), cannot be farmed by bouncing (clamped to new-max-only), and is zero while
+    # descending or on the flat.
+    #
+    # Scale: episodic return is ~3000, dominated by is_alive (3.0/step x ~900 steps). A full climb
+    # of the hardest tile is ~1.2 m, so weight 10 yields ~12 episodic reward for a complete climb
+    # (~0.4% of return) and ~0.2/step during active ascent -- a deliberate nudge, not a driver.
+    # Watch diag_mean_episode_max_climb_m and terrain level after enabling; if the plateau doesn't
+    # move, raise this before reaching for anything more invasive. Too high risks the policy
+    # rushing upward and eating a fall to bank the height (the new-max clamp limits this -- height
+    # lost in a fall is not re-payable -- but does not eliminate it).
+    rew_height_progress = 10.0
 
     feet_contact_sensor: ContactSensorCfg = ContactSensorCfg(
         prim_path="/World/envs/env_.*/Robot/.*_ankle_roll_link",

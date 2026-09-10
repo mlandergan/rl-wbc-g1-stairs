@@ -44,8 +44,10 @@ from .g1_stairs_env_cfg import (
     STAIRS_NUM_LEVELS,
     STAIRS_SPAWN_LATERAL_MARGIN_M,
     STAIRS_SPAWN_RADIUS_M,
+    STAIRS_GENERATOR_NUM_STEPS,
     STAIRS_STAIR_REGION_HALF_EXTENT_M,
     STAIRS_TREAD_DEPTH_ACTUAL_M,
+    STAIRS_TREAD_DEPTH_TRUE_M,
     G1StairsEnvCfg,
 )
 from .motions import MotionLoader
@@ -123,6 +125,27 @@ class G1StairsEnv(DirectRLEnv):
             i for i, name in enumerate(self.body_contact_sensor.body_names) if name not in feet_body_names
         ]
 
+        # torso_link is a distinct, higher body than the pelvis root on this pelvis-rooted asset
+        # (the same fact behind the contact-termination fix). Used by the world-frame torso
+        # orientation penalty in _get_rewards.
+        self.torso_link_body_index = self.robot.data.body_names.index("torso_link")
+
+        # Foot volume points, allocated only for the ablation arm that uses them so the baseline
+        # arm carries no extra buffer. Per-tile step height is deliberately NOT cached here: the
+        # curriculum rewrites terrain.env_origins as envs are promoted, so it is recomputed from
+        # the live origins on every call.
+        self._volume_points_pattern: torch.Tensor | None = None
+        if self.cfg.use_volume_points_edge_penalty:
+            self._volume_points_pattern = self._build_volume_points_pattern()
+            print(
+                f"[g1_stairs] volume-point edge penalty ENABLED: "
+                f"{self._volume_points_pattern.shape[0]} points/foot "
+                f"({len(self.feet_body_indexes)} feet), cylinder radius "
+                f"{self.cfg.edge_cylinder_radius_m:.3f} m, "
+                f"{STAIRS_GENERATOR_NUM_STEPS + 1} edge rings/tile, "
+                f"tread {STAIRS_TREAD_DEPTH_TRUE_M:.4f} m"
+            )
+
         self.termination_contact_body_indexes = []
         for name in self.cfg.termination_contact_body_names:
             if name not in self.body_contact_sensor.body_names:
@@ -168,9 +191,16 @@ class G1StairsEnv(DirectRLEnv):
 
         self._track_score_sum = torch.zeros(self.num_envs, device=self.device)
 
+        # Height-progress reward state (see rew_height_progress in the cfg). Per episode, track the
+        # spawn root height and the highest root height reached since; the term pays only for
+        # increases to that running max. Reset in _reset_idx.
+        self._episode_start_root_z = torch.zeros(self.num_envs, device=self.device)
+        self._episode_max_climb = torch.zeros(self.num_envs, device=self.device)
+
         # Per-cause termination diagnostics, populated by _get_dones and logged by _get_rewards.
         # Initialized here because _get_rewards can run before _get_dones has ever filled it.
         self._term_cause: dict[str, torch.Tensor] = {}
+        self._edge_diag: dict[str, torch.Tensor] = {}
 
         self._randomize_material_properties()
         self._log_terrain_geometry()
@@ -287,6 +317,91 @@ class G1StairsEnv(DirectRLEnv):
         edge_positions = k * STAIRS_TREAD_DEPTH_ACTUAL_M
         dist_to_each_edge = torch.abs(d_prime.unsqueeze(-1) - edge_positions)
         return dist_to_each_edge.min(dim=-1).values
+
+    def _build_volume_points_pattern(self) -> torch.Tensor:
+        """Sample grid spanning one foot's collision volume, in the ankle_roll_link frame, (P, 3).
+
+                Built once. The pattern is identical for both feet, so it is stored unbatched and
+                broadcast at use time rather than duplicated per foot per env.
+                """
+        cfg = self.cfg
+        num_x, num_y, num_z = cfg.volume_points_grid
+        xs = torch.linspace(*cfg.volume_points_x_range_m, num_x, device=self.device)
+        ys = torch.linspace(*cfg.volume_points_y_range_m, num_y, device=self.device)
+        zs = torch.linspace(*cfg.volume_points_z_range_m, num_z, device=self.device)
+        grid_x, grid_y, grid_z = torch.meshgrid(xs, ys, zs, indexing="ij")
+        return torch.stack([grid_x, grid_y, grid_z], dim=-1).reshape(-1, 3)
+
+    def _volume_points_world_state(self) -> tuple[torch.Tensor, torch.Tensor]:
+        """World positions and velocities of every foot volume point, each (num_envs, 2, P, 3).
+
+                Velocity is the rigid-body velocity carried out to the sample point,
+                `v_point = v_body + omega x r`, not the body velocity copied to every point. That
+                distinction is the whole reason the term can tell a foot pivoting over an edge (large
+                point velocity at the toe, near zero at the ankle) from one translating into it.
+                """
+        pos_w = self.robot.data.body_pos_w[:, self.feet_body_indexes]
+        quat_w = self.robot.data.body_quat_w[:, self.feet_body_indexes]
+        lin_vel_w = self.robot.data.body_lin_vel_w[:, self.feet_body_indexes]
+        ang_vel_w = self.robot.data.body_ang_vel_w[:, self.feet_body_indexes]
+
+        num_envs, num_feet = pos_w.shape[0], pos_w.shape[1]
+        pattern = self._volume_points_pattern
+        num_points = pattern.shape[0]
+
+        flat_quat = quat_w.reshape(-1, 4).unsqueeze(1).expand(-1, num_points, -1).reshape(-1, 4)
+        flat_pattern = pattern.unsqueeze(0).expand(num_envs * num_feet, -1, -1).reshape(-1, 3)
+        offset_w = quat_apply(flat_quat, flat_pattern).reshape(num_envs, num_feet, num_points, 3)
+
+        points_pos_w = pos_w.unsqueeze(2) + offset_w
+        points_vel_w = lin_vel_w.unsqueeze(2) + torch.linalg.cross(
+            ang_vel_w.unsqueeze(2).expand_as(offset_w), offset_w, dim=-1
+        )
+        return points_pos_w, points_vel_w
+
+    def _stair_edge_penetration_depth(self, points_pos_w: torch.Tensor) -> torch.Tensor:
+        """Depth each point has penetrated a virtual cylinder wrapped around a stair edge.
+
+                points_pos_w is (num_envs, F, P, 3); returns (num_envs, F, P), zero where a point is
+                outside every cylinder.
+
+                InstinctLab wraps cylinders around edges it *detects* in the terrain mesh, because its
+                terrains are arbitrary meshes. This project generates its own stairs, so the edges are
+                known in closed form and detection would only add a way to be wrong. Each pyramid-stair
+                tile has `STAIRS_GENERATOR_NUM_STEPS + 1` convex edges (one per riser, plus the centre
+                platform's lip), each a square ring at
+                    Chebyshev distance  c_k = half_extent - k * tread     from the tile centre
+                    height              z_k = (k + 1) * step_height
+                with `step_height = env_origins_z / (num_steps + 1)` recovered per tile from the
+                generator's own origin identity -- read fresh each call rather than cached, because
+                curriculum promotion moves an env to a tile with a different step height.
+
+                Distance to a ring is measured in the (inward-distance, height) cross-section, which is
+                exact for the straight runs since the edge is perpendicular to that plane. It slightly
+                over-states distance within a cylinder radius of the four corners, where the true
+                nearest feature is the corner point rather than either edge line; at a 5 cm radius that
+                is a handful of square centimetres per tile and always in the conservative direction
+                (under-reporting penetration, never inventing it).
+                """
+        origin = self.terrain.env_origins
+        num_steps = STAIRS_GENERATOR_NUM_STEPS
+        step_height = origin[:, 2] / float(num_steps + 1)
+
+        origin_x = origin[:, 0].view(-1, 1, 1)
+        origin_y = origin[:, 1].view(-1, 1, 1)
+        cheb = torch.maximum(
+            torch.abs(points_pos_w[..., 0] - origin_x), torch.abs(points_pos_w[..., 1] - origin_y)
+        )
+        inward = STAIRS_STAIR_REGION_HALF_EXTENT_M - cheb
+
+        k = torch.arange(num_steps + 1, device=points_pos_w.device, dtype=points_pos_w.dtype)
+        horizontal = inward.unsqueeze(-1) - k * STAIRS_TREAD_DEPTH_TRUE_M
+        edge_z = (k + 1.0).view(1, 1, 1, -1) * step_height.view(-1, 1, 1, 1)
+        vertical = points_pos_w[..., 2].unsqueeze(-1) - edge_z
+
+        distance = torch.sqrt(horizontal * horizontal + vertical * vertical + 1.0e-12)
+        depth = torch.clamp(self.cfg.edge_cylinder_radius_m - distance, min=0.0)
+        return depth.max(dim=-1).values
 
     def _randomize_material_properties(self):
         """Randomize friction and restitution once at startup.
@@ -507,11 +622,31 @@ class G1StairsEnv(DirectRLEnv):
             per_foot.append(torch.sum(clearance * feet_in_contact[:, col].unsqueeze(-1).float(), dim=-1))
         rew_feet_height_error = self.cfg.rew_feet_height_error * (per_foot[0] + per_foot[1])
 
-        edge_violation = torch.clamp(self.cfg.edge_safety_margin_m - edge_dist, min=0.0)
-        feet_speed = torch.norm(feet_vel_w, dim=-1)
-        rew_edge_penetration = self.cfg.rew_edge_penetration * torch.sum(
-            edge_violation * (feet_speed + 1.0e-3) * feet_in_contact.float(), dim=1
-        )
+        # Exclusive ablation arms -- exactly one edge term is ever applied.
+        if self.cfg.use_volume_points_edge_penalty:
+            # Volume-point arm. No contact gate: penetration is measured geometrically, so a swing
+            # foot clipping through an edge is penalised even though it registers no contact force
+            # (the single-point arm below cannot see that case at all). Velocity weighting is what
+            # keeps a foot resting still against an edge cheap while one driving through it is not.
+            points_pos_w, points_vel_w = self._volume_points_world_state()
+            penetration_depth = self._stair_edge_penetration_depth(points_pos_w)
+            points_speed = torch.norm(points_vel_w, dim=-1)
+            in_obstacle = (penetration_depth > 0.0).float()
+            penetration_cost = in_obstacle * (points_speed + 1.0e-6) * penetration_depth
+            rew_edge_penetration = self.cfg.rew_volume_points_penetration * torch.sum(
+                penetration_cost.flatten(start_dim=1), dim=1
+            )
+            self._edge_diag = {
+                "diag_edge_points_penetrating": in_obstacle.flatten(start_dim=1).sum(dim=1).mean(),
+                "diag_edge_max_penetration_m": penetration_depth.flatten(start_dim=1).max(dim=1).values.mean(),
+            }
+        else:
+            edge_violation = torch.clamp(self.cfg.edge_safety_margin_m - edge_dist, min=0.0)
+            feet_speed = torch.norm(feet_vel_w, dim=-1)
+            rew_edge_penetration = self.cfg.rew_edge_penetration * torch.sum(
+                edge_violation * (feet_speed + 1.0e-3) * feet_in_contact.float(), dim=1
+            )
+            self._edge_diag = {}
 
         rew_heading_error = self.cfg.rew_heading_error * torch.abs(self.commands[:, 2])
 
@@ -592,6 +727,24 @@ class G1StairsEnv(DirectRLEnv):
         height_rel_to_goal = self.robot.data.root_pos_w[:, 2] - self.terrain.env_origins[:, 2]
         rew_max_height = self.cfg.rew_max_height * height_rel_to_goal
 
+        # World-frame torso-link orientation penalty (InstinctLab's link_orientation formula):
+        # gravity projected into the torso frame, squared xy. Zero when the torso is vertical,
+        # grows as it pitches or rolls -- independent of the pelvis term, so it catches a torso
+        # leaning back even while the pelvis stays level.
+        torso_quat_w = self.robot.data.body_quat_w[:, self.torso_link_body_index]
+        torso_projected_gravity = quat_apply_inverse(torso_quat_w, self.robot.data.GRAVITY_VEC_W)
+        rew_torso_orientation_l2 = self.cfg.rew_torso_orientation_l2 * torch.sum(
+            torch.square(torso_projected_gravity[:, :2]), dim=1
+        )
+
+        # Height-progress reward: pay only for new maximum root height above this episode's spawn
+        # height. Sums per episode to (weight * total height climbed); clamped to new-max-only so
+        # it can't be farmed by bouncing, and zero while flat or descending.
+        climb_now = self.robot.data.root_pos_w[:, 2] - self._episode_start_root_z
+        new_climb = torch.clamp(climb_now - self._episode_max_climb, min=0.0)
+        self._episode_max_climb = torch.maximum(self._episode_max_climb, climb_now)
+        rew_height_progress = self.cfg.rew_height_progress * new_climb
+
         rew_is_alive = self.cfg.rew_is_alive * (~self.reset_terminated).float()
 
         lin_vel_err_for_curriculum = torch.sum(
@@ -601,7 +754,7 @@ class G1StairsEnv(DirectRLEnv):
 
         total_reward = (
             total_reward + rew_feet_height_error + rew_edge_penetration + rew_dont_wait + rew_stand_still
-            + rew_max_height
+            + rew_max_height + rew_torso_orientation_l2 + rew_height_progress
             + rew_heading_error + rew_feet_air_time + rew_feet_slide + rew_energy + rew_torque_limits
             + rew_undesired_contacts + rew_dof_vel_limits + rew_dof_vel_l2
             + rew_is_alive + rew_feet_close_xy
@@ -614,6 +767,12 @@ class G1StairsEnv(DirectRLEnv):
         reward_log["rew_dont_wait"] = rew_dont_wait.mean()
         reward_log["rew_stand_still"] = rew_stand_still.mean()
         reward_log["rew_max_height"] = rew_max_height.mean()
+        reward_log["rew_torso_orientation_l2"] = rew_torso_orientation_l2.mean()
+        reward_log["rew_height_progress"] = rew_height_progress.mean()
+        reward_log["diag_torso_tilt_rad"] = torch.acos(
+            torch.clamp(-torso_projected_gravity[:, 2], -1.0, 1.0)
+        ).mean()
+        reward_log["diag_mean_episode_max_climb_m"] = self._episode_max_climb.mean()
         reward_log["rew_heading_error"] = rew_heading_error.mean()
         reward_log["rew_feet_air_time"] = rew_feet_air_time.mean()
         reward_log["rew_feet_slide"] = rew_feet_slide.mean()
@@ -633,6 +792,7 @@ class G1StairsEnv(DirectRLEnv):
         ).mean()
 
         reward_log.update(self._term_cause)
+        reward_log.update(self._edge_diag)
         self.extras["log"] = reward_log
         return total_reward
 
@@ -718,6 +878,11 @@ class G1StairsEnv(DirectRLEnv):
         self.robot.write_root_link_pose_to_sim(root_state[:, :7], env_ids)
         self.robot.write_root_com_velocity_to_sim(root_state[:, 7:], env_ids)
         self.robot.write_joint_state_to_sim(joint_pos, joint_vel, None, env_ids)
+
+        # Height-progress reward bookkeeping: the spawn root height is the per-episode zero, and
+        # the running climbed-max starts empty. root_state[:, 2] is the pose just written above.
+        self._episode_start_root_z[env_ids] = root_state[:, 2]
+        self._episode_max_climb[env_ids] = 0.0
         self._resample_commands(env_ids)
         self._update_position_based_commands()
 

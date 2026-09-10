@@ -46,8 +46,25 @@ parser.add_argument(
 parser.add_argument("--seed", type=int, default=None, help="Seed used for the environment.")
 parser.add_argument("--checkpoint", type=str, default=None, help="Path to model checkpoint to resume training.")
 parser.add_argument("--max_iterations", type=int, default=None, help="Override the yaml's trainer.timesteps.")
+# Ported from Isaac Lab's stock train.py -- OFF by default (default=False, matching stock), since
+# this project's own play_amp_depth.py docstring documents actual hangs from running a second,
+# separate Isaac Sim/RTX process concurrently with training on this VM's GPU. Recording in-process
+# (this flag) uses the same single Isaac Sim instance/CUDA context training already has, so that
+# failure mode does not apply here -- but `--enable_cameras` (forced on below when --video is set)
+# has its own, currently-unmeasured GPU memory cost from booting the RTX render pipeline, on top
+# of whatever headroom num_envs leaves. Verify with nvidia-smi on the first real use before
+# assuming it is free at a given num_envs, especially near 4096.
+parser.add_argument("--video", action="store_true", default=False, help="Record videos during training.")
+parser.add_argument("--video_length", type=int, default=200, help="Length of each recorded video, in steps.")
+parser.add_argument(
+    "--video_interval", type=int, default=2000, help="Env steps between recordings (gym RecordVideo's step_trigger)."
+)
 AppLauncher.add_app_launcher_args(parser)
 args_cli, hydra_args = parser.parse_known_args()
+# Must happen before AppLauncher(args_cli) below -- Kit boots with the RTX render pipeline on or
+# not at all; there is no enabling it after the app has already launched.
+if args_cli.video:
+    args_cli.enable_cameras = True
 sys.argv = [sys.argv[0]] + hydra_args
 
 app_launcher = AppLauncher(args_cli)
@@ -103,7 +120,23 @@ def main(env_cfg: DirectRLEnvCfg, agent_cfg: dict):
     dump_yaml(os.path.join(log_dir, "params", "env.yaml"), env_cfg)
     dump_yaml(os.path.join(log_dir, "params", "agent.yaml"), agent_cfg)
 
-    env = gym.make(args_cli.task, cfg=env_cfg, render_mode=None)
+    env = gym.make(args_cli.task, cfg=env_cfg, render_mode="rgb_array" if args_cli.video else None)
+
+    if args_cli.video:
+        video_kwargs = {
+            "video_folder": os.path.join(log_dir, "videos", "train"),
+            "step_trigger": lambda step: step % args_cli.video_interval == 0,
+            "video_length": args_cli.video_length,
+            "disable_logger": True,
+        }
+        print("[INFO] Recording videos during training.")
+        print_dict(video_kwargs, nesting=4)
+        env = gym.wrappers.RecordVideo(env, **video_kwargs)
+
+    # RecordVideo wraps the raw gym env's rgb_array render, which needs its own viewport camera
+    # separate from this task's own ray-cast depth sensor (RayCasterCamera via Warp) that feeds
+    # the policy -- the two do not conflict; the ray-cast sensor never touches the RTX renderer
+    # this flag turns on.
     env = SkrlVecEnvWrapper(env)
     device = env.device
 
