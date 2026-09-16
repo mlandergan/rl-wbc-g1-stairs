@@ -11,13 +11,15 @@
 #
 # Usage (on the VM, from repo root):
 #   ./scripts/export_checkpoint_videos.sh [RUN_DIR]
-# RUN_DIR defaults to the most recently modified logs/skrl/g1_stairs/*_ppo_torch directory.
+# RUN_DIR defaults to the most recently modified run under logs/skrl/g1_stairs/.
 set -euo pipefail
 
 NUM_ENVS="${NUM_ENVS:-4}"      # play_amp_depth.py's own default; fewer robots = clearer video
 VIDEO_LENGTH="${VIDEO_LENGTH:-200}"
 
-RUN_DIR="${1:-$(find "$(pwd)/logs/skrl/g1_stairs" -maxdepth 1 -type d -name '*_ppo_torch' | sort | tail -1)}"
+# Matches any run dir, not just '*_ppo_torch' -- train_amp_depth.py writes '*_wasabi_amp_depth',
+# so the old glob silently matched nothing (or a stale PPO run) when called with no argument.
+RUN_DIR="${1:-$(find "$(pwd)/logs/skrl/g1_stairs" -mindepth 1 -maxdepth 1 -type d | sort | tail -1)}"
 CKPT_DIR="${RUN_DIR}/checkpoints"
 
 if [[ ! -d "${CKPT_DIR}" ]]; then

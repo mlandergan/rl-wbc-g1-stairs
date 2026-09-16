@@ -180,7 +180,14 @@ class G1StairsEnvCfg(DirectRLEnvCfg):
     rew_lin_vel_z_l2 = -0.2
     rew_ang_vel_xy_l2 = -0.05
     rew_joint_deviation_hip = -0.5
-    rew_joint_deviation_arms = -0.004
+    # Raised from -0.004 (InstinctLab's value) 2026-09-16. With the arms dropped from the AMP
+    # observation, this is now the ONLY term governing arm posture -- the discriminator no longer
+    # has an opinion about them at all. At -0.004 a fully contorted arm (~2 rad of summed
+    # deviation) cost ~0.008/step against a ~4.7/step total reward: nothing. -0.05 makes that same
+    # pose cost ~0.1/step -- enough to pull the arms back toward default without dominating.
+    # Judgment call on the magnitude, not a measured optimum; watch rew_joint_deviation_arms and
+    # the rendered arm pose on the next run and retune if the arms go stiff or stay loose.
+    rew_joint_deviation_arms = -0.05
     rew_joint_deviation_torso = -0.004
 
     # Positive weight but still a penalty: the formula is exp(-clamp(thr - dy, 0)/std^2) - 1,
@@ -361,8 +368,13 @@ class G1StairsEnvCfg(DirectRLEnvCfg):
 
     privileged_obs_dim = 5
 
+    # Proprioception the POLICY sees: all 29 actuated joints. Layout is
+    # (dof_pos 29 + dof_vel 29 + root tangent/normal 6 + root lin vel 3 + root ang vel 3) = 70,
+    # plus 10 key-body offsets x 3. The policy actuates the arms, so it must keep arm state.
+    policy_proprio_dim = (29 + 29 + 6 + 3 + 3) + 3 * 10
+
     observation_space = (
-        policy_proprio_history_len * (70 + 3 * 10)
+        policy_proprio_history_len * policy_proprio_dim
         + 3
         + depth_history_len * DEPTH_FINAL_SIZE**2
         + privileged_obs_dim
@@ -370,7 +382,28 @@ class G1StairsEnvCfg(DirectRLEnvCfg):
     action_space = 29
     state_space = 0
     num_amp_observations = 10
-    amp_observation_space = 70 + 3 * 10
+
+    # Joints EXCLUDED from the AMP/discriminator observation. The 14 arm joints are dropped
+    # (2026-09-16) because the reference clip has no arm data to score against: every arm channel
+    # in G1_parkour_climb.npz is frozen at a constant (range exactly 0.000 across all 1048
+    # frames). The source take does contain real arm motion, but not during the climb -- the
+    # extracted ascending segment is source frames 1927-2975, and the first frame with ANY
+    # shoulder movement is frame 2974. After that point the take is flat (best net rise over any
+    # window: +0.074 m), so climbing and live arms never co-occur and there is no better segment
+    # to pick.
+    #
+    # Leaving them in gave the discriminator 14 zero-variance dimensions, which is pathological:
+    # any arm motion at all is instantly separable as "fake", so the discriminator can win on the
+    # arms alone. That both saturates it (weakening the gait signal it exists to provide) and
+    # leaves the arms with no usable style gradient -- which, with only rew_joint_deviation_arms
+    # at -0.004 opposing it, let a converged policy settle into an arbitrary contorted arm pose.
+    # Scoring gait only, and governing the arms directly via the deviation penalty instead.
+    amp_excluded_joint_patterns = (
+        r".*_shoulder_pitch_joint", r".*_shoulder_roll_joint", r".*_shoulder_yaw_joint",
+        r".*_elbow_joint", r".*_wrist_roll_joint", r".*_wrist_pitch_joint", r".*_wrist_yaw_joint",
+    )
+    _amp_num_dofs = 29 - 14
+    amp_observation_space = (_amp_num_dofs + _amp_num_dofs + 6 + 3 + 3) + 3 * 10
 
     action_scale = 0.5
 
@@ -400,7 +433,28 @@ class G1StairsEnvCfg(DirectRLEnvCfg):
     termination_contact_body_names = ["pelvis"]
     termination_contact_threshold_n = 1.0
 
+    # Kept for the diagnostic only -- promotion no longer gates on it (see below).
     terrain_curriculum_lin_vel_threshold = (0.3, 0.6)
+
+    # Curriculum promotion on CLIMB PROGRESS, not velocity tracking.
+    #
+    # Why this changed (2026-09-16): velocity-tracking promotion put the curriculum in a fight
+    # with physics. The command is `v_x = clamp(2.0 * dist_to_goal, 0, command_lin_vel_x_max)`,
+    # which saturates at 0.8 m/s at EVERY terrain level. At level 9 (0.20 m riser / 0.2794 m
+    # tread = 35.6 deg) tracking 0.8 m/s horizontally means 0.57 m/s vertical -- a 20 cm step
+    # every 0.35 s, ~2.9 steps/s, which a G1 cannot do. So envs promoted until the commanded
+    # speed outran what is kinematically possible, tracking collapsed, the score fell under the
+    # promotion bar, and they were demoted straight back. Measured: mean terrain level sat in a
+    # 6.0-6.6 band for 8500 straight iterations with per-step tracking ~0.795, while mean planar
+    # distance to goal never approached the 0.4 m arrival threshold (plateaued 1.08-1.15 m) and
+    # max climb per episode reached only ~0.72 m of the 0.90 m available at level 6. The binding
+    # constraint was command design, not policy skill -- more training could not move it.
+    #
+    # Promotion now asks the question the task actually cares about: did it get up the stairs?
+    # `climb_fraction` = (episode max root-height gain) / (that tile's platform height), so 1.0
+    # means a full summit and 0 means it never left the bottom. Reaching the goal promotes
+    # outright regardless of fraction, since arrival is the unambiguous success signal.
+    terrain_curriculum_climb_fraction_threshold = (0.35, 0.80)
 
     event_static_friction_range = (0.3, 1.6)
     event_dynamic_friction_range = (0.3, 1.6)

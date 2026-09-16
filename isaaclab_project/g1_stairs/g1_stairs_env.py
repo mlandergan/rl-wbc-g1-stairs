@@ -100,6 +100,20 @@ class G1StairsEnv(DirectRLEnv):
         ])
         self.torso_deviation_dof_indexes = _match([r"waist_yaw_joint", r"waist_roll_joint", r"waist_pitch_joint"])
 
+        # Joints the DISCRIMINATOR sees: everything except the excluded (arm) patterns. Built as
+        # positions within motion_joint_names so the robot-side and motion-side index lists below
+        # stay in the same order -- the discriminator compares the two element-wise, so a mismatch
+        # here would silently score the wrong joint against the wrong joint.
+        amp_excluded = _match(list(self.cfg.amp_excluded_joint_patterns))
+        amp_keep = [i for i in range(len(motion_joint_names)) if i not in set(amp_excluded)]
+        self.amp_dof_indexes = [self.action_dof_indexes[i] for i in amp_keep]
+        self.motion_amp_dof_indexes = [self.motion_dof_indexes[i] for i in amp_keep]
+        assert len(self.amp_dof_indexes) == len(self.motion_amp_dof_indexes), "AMP joint subset mismatch"
+        print(
+            f"[g1_stairs] AMP observation covers {len(amp_keep)}/{len(motion_joint_names)} joints "
+            f"({len(amp_excluded)} arm joints excluded -- reference clip has no arm motion)"
+        )
+
         key_body_names = [
             "left_shoulder_pitch_link", "right_shoulder_pitch_link",
             "left_elbow_link", "right_elbow_link",
@@ -161,8 +175,10 @@ class G1StairsEnv(DirectRLEnv):
             (self.num_envs, self.cfg.num_amp_observations, self.cfg.amp_observation_space), device=self.device
         )
 
+        # Sized by policy_proprio_dim, NOT amp_observation_space -- those are different now that
+        # the arms are excluded from the discriminator but kept for the policy.
         self.policy_proprio_buffer = torch.zeros(
-            (self.num_envs, self.cfg.policy_proprio_history_len, self.cfg.amp_observation_space),
+            (self.num_envs, self.cfg.policy_proprio_history_len, self.cfg.policy_proprio_dim),
             device=self.device,
         )
 
@@ -197,10 +213,15 @@ class G1StairsEnv(DirectRLEnv):
         self._episode_start_root_z = torch.zeros(self.num_envs, device=self.device)
         self._episode_max_climb = torch.zeros(self.num_envs, device=self.device)
 
+        # Sticky per-episode flag: did this env ever get within the arrival threshold of its goal?
+        # Drives terrain-curriculum promotion together with climb fraction. Reset in _reset_idx.
+        self._episode_reached_goal = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+
         # Per-cause termination diagnostics, populated by _get_dones and logged by _get_rewards.
         # Initialized here because _get_rewards can run before _get_dones has ever filled it.
         self._term_cause: dict[str, torch.Tensor] = {}
         self._edge_diag: dict[str, torch.Tensor] = {}
+        self._curriculum_diag: dict[str, torch.Tensor] = {}
 
         self._randomize_material_properties()
         self._log_terrain_geometry()
@@ -453,11 +474,18 @@ class G1StairsEnv(DirectRLEnv):
                   f"({int(mask.sum().item())} envs)")
 
     def _update_terrain_curriculum(self, env_ids: torch.Tensor):
-        """Promote or demote envs a terrain level on their episode-mean tracking score.
+        """Promote or demote envs a terrain level on how far up the stairs they actually got.
+
+                Promotion criterion is climb progress, not velocity tracking -- see
+                `terrain_curriculum_climb_fraction_threshold` in the cfg for the measured reason that
+                changed. An env promotes if it reached the goal at any point, or if its best
+                root-height gain covered more than `high` of the tile's platform height; it demotes
+                below `low`. A fall still demotes naturally: the episode ends early, so the climb it
+                banked before falling is all it gets credit for.
 
                 Must run before the new spawn pose is computed: it rewrites `terrain.env_origins`, which
-                both the spawn placement and the goal read from. Score is normalized by max_episode_length
-                rather than actual length, so an episode cut short by a fall scores low and demotes.
+                both the spawn placement and the goal read from -- so platform height is read off the
+                OLD origins at the top, before that rewrite.
                 """
         # The trainer's first reset has no episode behind it; without this guard its all-zero
         # score would demote every env off its starting level before training begins.
@@ -466,11 +494,25 @@ class G1StairsEnv(DirectRLEnv):
             self._track_score_sum[env_ids] = 0.0
             return
 
-        low, high = self.cfg.terrain_curriculum_lin_vel_threshold
-        score = self._track_score_sum[env_ids] / self.max_episode_length
-        move_up = (score > high) & ran
-        move_down = (score < low) & ran & ~move_up
+        # Platform height of the tile the env just finished on. Must be read BEFORE
+        # update_env_origins below, which rewrites env_origins to the NEW level.
+        platform_height = self.terrain.env_origins[env_ids, 2]
+        climb_fraction = self._episode_max_climb[env_ids] / platform_height.clamp(min=1.0e-3)
+        reached_goal = self._episode_reached_goal[env_ids]
+
+        low, high = self.cfg.terrain_curriculum_climb_fraction_threshold
+        move_up = ((climb_fraction > high) | reached_goal) & ran
+        move_down = (climb_fraction < low) & ran & ~move_up
         self.terrain.update_env_origins(env_ids, move_up, move_down)
+
+        self._curriculum_diag = {
+            "diag_curriculum_climb_fraction": climb_fraction.mean(),
+            "diag_curriculum_move_up_frac": move_up.float().mean(),
+            "diag_curriculum_move_down_frac": move_down.float().mean(),
+            # The old velocity-tracking score, kept as a diagnostic so runs before and after this
+            # change stay comparable -- it no longer gates promotion.
+            "diag_curriculum_track_score": (self._track_score_sum[env_ids] / self.max_episode_length).mean(),
+        }
         self._track_score_sum[env_ids] = 0.0
 
     def _apply_action(self):
@@ -479,14 +521,25 @@ class G1StairsEnv(DirectRLEnv):
         self.robot.set_joint_position_target(target)
 
     def _get_observations(self) -> dict:
-        amp_obs = compute_obs(
-            self.robot.data.joint_pos[:, self.action_dof_indexes],
-            self.robot.data.joint_vel[:, self.action_dof_indexes],
+        # Two separate observations now: the discriminator's (arms excluded -- the reference clip
+        # has no arm data to score against) and the policy's proprioception (all joints, since the
+        # policy actuates the arms and needs their state).
+        root_args = (
             self.robot.data.body_pos_w[:, self.ref_body_index],
             self.robot.data.body_quat_w[:, self.ref_body_index],
             self.robot.data.body_lin_vel_w[:, self.ref_body_index],
             self.robot.data.body_ang_vel_w[:, self.ref_body_index],
             self.robot.data.body_pos_w[:, self.key_body_indexes],
+        )
+        amp_obs = compute_obs(
+            self.robot.data.joint_pos[:, self.amp_dof_indexes],
+            self.robot.data.joint_vel[:, self.amp_dof_indexes],
+            *root_args,
+        )
+        proprio_obs = compute_obs(
+            self.robot.data.joint_pos[:, self.action_dof_indexes],
+            self.robot.data.joint_vel[:, self.action_dof_indexes],
+            *root_args,
         )
 
         for i in reversed(range(self.cfg.num_amp_observations - 1)):
@@ -496,7 +549,7 @@ class G1StairsEnv(DirectRLEnv):
 
         for i in reversed(range(self.cfg.policy_proprio_history_len - 1)):
             self.policy_proprio_buffer[:, i + 1] = self.policy_proprio_buffer[:, i]
-        self.policy_proprio_buffer[:, 0] = amp_obs.clone()
+        self.policy_proprio_buffer[:, 0] = proprio_obs.clone()
         proprio_history_flat = self.policy_proprio_buffer.view(self.num_envs, -1)
 
         depth_now = self._process_depth_image().view(self.num_envs, -1)
@@ -787,12 +840,19 @@ class G1StairsEnv(DirectRLEnv):
         base_terrain_h = self._base_terrain_height()
         reward_log["diag_mean_terrain_height_at_root"] = base_terrain_h.mean()
         reward_log["diag_mean_terrain_level"] = self.terrain.terrain_levels.float().mean()
-        reward_log["diag_mean_planar_dist_to_goal"] = torch.norm(
+        planar_dist_to_goal = torch.norm(
             self.goal_pos_w[:, :2] - self.robot.data.root_pos_w[:, :2], dim=-1
-        ).mean()
+        )
+        reward_log["diag_mean_planar_dist_to_goal"] = planar_dist_to_goal.mean()
+
+        # Latch goal arrival for the episode. Sticky: the curriculum asks whether the robot EVER
+        # arrived, not whether it happens to be parked there on the terminal step.
+        self._episode_reached_goal |= planar_dist_to_goal <= self.cfg.command_target_dist_threshold_m
+        reward_log["diag_frac_reached_goal"] = self._episode_reached_goal.float().mean()
 
         reward_log.update(self._term_cause)
         reward_log.update(self._edge_diag)
+        reward_log.update(self._curriculum_diag)
         self.extras["log"] = reward_log
         return total_reward
 
@@ -883,6 +943,7 @@ class G1StairsEnv(DirectRLEnv):
         # the running climbed-max starts empty. root_state[:, 2] is the pose just written above.
         self._episode_start_root_z[env_ids] = root_state[:, 2]
         self._episode_max_climb[env_ids] = 0.0
+        self._episode_reached_goal[env_ids] = False
         self._resample_commands(env_ids)
         self._update_position_based_commands()
 
@@ -1029,9 +1090,11 @@ class G1StairsEnv(DirectRLEnv):
             body_linear_velocities,
             body_angular_velocities,
         ) = self._motion_loader.sample(num_samples=num_samples, times=times)
+        # motion_amp_dof_indexes, not motion_dof_indexes: must match the arm-excluded subset the
+        # policy side builds in _get_observations, element for element.
         amp_observation = compute_obs(
-            dof_positions[:, self.motion_dof_indexes],
-            dof_velocities[:, self.motion_dof_indexes],
+            dof_positions[:, self.motion_amp_dof_indexes],
+            dof_velocities[:, self.motion_amp_dof_indexes],
             body_positions[:, self.motion_ref_body_index],
             body_rotations[:, self.motion_ref_body_index],
             body_linear_velocities[:, self.motion_ref_body_index],
