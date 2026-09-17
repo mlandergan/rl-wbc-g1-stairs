@@ -213,7 +213,22 @@ class G1StairsEnvCfg(DirectRLEnvCfg):
     feet_close_xy_threshold_m = 0.12
     feet_close_xy_std = math.sqrt(0.05)
 
-    rew_feet_air_time = 0.5
+    # 0.5 -> 2.0 (2026-09-16) to give the gait term enough weight to actually compete.
+    #
+    # The value this scales is min-over-feet of in-mode time, zeroed unless exactly one foot is in
+    # contact; both current_contact_time and current_air_time reset at every transition, so during
+    # a single-support phase it ramps 0 -> T and its episode mean is f * T/2, where f is the
+    # fraction of time spent in single support. On the 2026-09-16 run it logged 0.0292/step, i.e.
+    # a raw value of 0.058 s. (That does NOT mean 58 ms of single support -- f and T cannot be
+    # separated from one scalar. At f = 20-70%, T is 0.17-0.58 s.)
+    #
+    # Sizing is based on what an IMPROVEMENT buys, not on the current value. Against a net 2.40
+    # reward/step, moving the raw value 0.058 -> 0.20 (a plausible stepping gait) is worth 3.0% of
+    # net at weight 0.5 -- invisible, the policy has no reason to chase it -- and 11.8% at 2.0.
+    # Weight 4.0 would make it dominant (23.6%) and 8.0 invites the obvious hack: stand on one leg
+    # and bank stance time instead of walking (only loosely opposed by dont_wait and the velocity
+    # tracking term, both of which it could partly satisfy while barely moving).
+    rew_feet_air_time = 2.0
     feet_air_time_vel_threshold_mps = 0.15
     rew_feet_slide = -0.4
     rew_energy = -5.0e-5
