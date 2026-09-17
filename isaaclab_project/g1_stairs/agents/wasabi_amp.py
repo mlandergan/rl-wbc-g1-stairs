@@ -104,6 +104,20 @@ class WasabiAMP(AMP):
 
         combined_rewards = self._task_reward_weight * rewards + self._style_reward_weight * style_reward
 
+        # Log the style/task split. skrl only reports the env's task reward and the combined
+        # value, so the style term's actual contribution was invisible -- which mattered: on the
+        # 2026-09-16 run the discriminator loss fell to 0.031, implying D(fake) ~= -0.875 and a
+        # style reward near 0.12, i.e. roughly 1% of the reward signal. That is indistinguishable
+        # from AMP being switched off, and it is the leading explanation for the ungraceful gait.
+        # Inferring it from discriminator loss is not good enough to tune against, so measure it.
+        self.track_data("AMP / style reward (raw)", style_reward.mean().item())
+        self.track_data("AMP / style contribution", (self._style_reward_weight * style_reward).mean().item())
+        self.track_data("AMP / task contribution", (self._task_reward_weight * rewards).mean().item())
+        self.track_data("AMP / discriminator logit", amp_logits.mean().item())
+        _style_abs = (self._style_reward_weight * style_reward).abs().mean()
+        _task_abs = (self._task_reward_weight * rewards).abs().mean()
+        self.track_data("AMP / style share", (_style_abs / (_style_abs + _task_abs + 1.0e-8)).item())
+
         # compute returns and advantages
         values = self.memory.get_tensor_by_name("values")
         next_values = self.memory.get_tensor_by_name("next_values")

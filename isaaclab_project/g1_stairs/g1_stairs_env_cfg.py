@@ -117,6 +117,23 @@ _G1_29DOF_SOFT_ARMS_CFG.actuators["waist"].stiffness = 200.0
 _G1_29DOF_SOFT_ARMS_CFG.actuators["waist"].damping = 5.0
 _G1_29DOF_SOFT_ARMS_CFG.spawn.activate_contact_sensors = True
 
+# Self-collision ON (2026-09-16). G1_29DOF_CFG ships this False, so nothing stopped the arms
+# passing straight THROUGH the torso, head and legs -- visible in the level-9 pinned video, where
+# the arms reach poses the real robot physically cannot hold and intersect the body. No reward can
+# fix that; it is a physics setting.
+#
+# Why the arms get thrown around in the first place is separate and NOT fixed here: the arm
+# actuators are deliberately soft (40/10), which is correct -- that value matches Isaac Lab's own
+# G1_MINIMAL_CFG and is what Projects 1 and 2 both use (the stock G1_29DOF_CFG value of 3000 is a
+# mocap position-hold gain, rejected in rl-wbc-g1-amp as "a destabilizing torque source on the
+# torso every step"). Soft arms are fine when something guides them; measured deviation is ~0.62
+# rad/joint, consistent with inertial loads from the current hoppy gait overwhelming a 40 N*m/rad
+# spring rather than with the policy choosing that pose.
+#
+# Costs simulation time -- self-collision pairs are not free. Worth measuring against the previous
+# ~4.2 it/s if throughput drops noticeably.
+_G1_29DOF_SOFT_ARMS_CFG.spawn.articulation_props.enabled_self_collisions = True
+
 # DelayedPDActuator is an EXPLICIT actuator model where the stock G1 config uses implicit PhysX
 # PD. Same gains either way (as InstinctLab does it), but the dynamics are not identical -- set
 # this False first if a run is unstable in a way nothing else explains.
@@ -357,6 +374,25 @@ class G1StairsEnvCfg(DirectRLEnvCfg):
 
     debug_vis_goal: bool = False
 
+    # Visualization-only, both OFF by default and both independent of the reward path. They show
+    # what the edge penalty is actually looking at: `debug_vis_stair_edges` draws a translucent
+    # cylinder along every stair edge, and `debug_vis_foot_points` draws the per-foot sample grid,
+    # red where a point is inside one of those cylinders. Turning either on computes the volume
+    # points regardless of `use_volume_points_edge_penalty`, so the geometry can be inspected
+    # without the reward arm being active. Enabled in the _PLAY cfg; leave off for training (they
+    # cost render time and nothing is watching headless).
+    debug_vis_foot_points: bool = False
+    debug_vis_stair_edges: bool = False
+
+    # Visual thickness of the drawn edge cylinders, as a fraction of the real
+    # `edge_cylinder_radius_m`. At 1.0 the drawing is literally the penalty volume -- a foot point
+    # turns red exactly when it enters what you see -- but at the true 5 cm radius the tubes are
+    # thick enough to hide the stair geometry underneath them. Scaling down keeps the edges
+    # readable at the cost of that 1:1 correspondence: the PENALTY still uses the full
+    # edge_cylinder_radius_m, only the rendering is thinner. Set to 1.0 when you want to see the
+    # real penalty volume rather than a legible diagram.
+    debug_vis_edge_radius_scale: float = 0.3
+
     episode_length_s = 20.0
     decimation = 4
 
@@ -532,6 +568,9 @@ class G1StairsEnvCfg_PLAY(G1StairsEnvCfg):
         self.scene.num_envs = 32
         self.scene.env_spacing = 3.0
         self.debug_vis_goal = True
+        self.debug_vis_foot_points = True
+        self.debug_vis_stair_edges = True
+        # Follow-cam by default; play_amp_depth.py --camera fixed swaps this for a static shot.
         self.viewer.origin_type = "asset_root"
         self.viewer.asset_name = "robot"
         self.viewer.env_index = 0

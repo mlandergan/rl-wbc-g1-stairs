@@ -62,6 +62,37 @@ GOAL_MARKER_CFG = VisualizationMarkersCfg(
     },
 )
 
+# Foot volume points, drawn the way InstinctLab draws its own: one small sphere per sample point,
+# green when clear and red when inside an edge cylinder. Marker index 0/1 selects between the two
+# prototypes, so a single visualize() call colours every point.
+FOOT_POINTS_MARKER_CFG = VisualizationMarkersCfg(
+    prim_path="/Visuals/foot_volume_points",
+    markers={
+        "clear": sim_utils.SphereCfg(
+            radius=0.008,
+            visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.1, 0.9, 0.1)),
+        ),
+        "penetrating": sim_utils.SphereCfg(
+            radius=0.012,
+            visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(1.0, 0.1, 0.1)),
+        ),
+    },
+)
+
+# The edge-penalty geometry itself: a translucent cylinder along every stair edge, radius
+# `edge_cylinder_radius_m`. A foot point turning red is exactly a point that has entered one of
+# these. Unit radius/height here -- visualize() scales each instance to the real size.
+EDGE_CYLINDER_MARKER_CFG = VisualizationMarkersCfg(
+    prim_path="/Visuals/stair_edges",
+    markers={
+        "edge": sim_utils.CylinderCfg(
+            radius=1.0,
+            height=1.0,
+            visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.1, 0.3, 1.0), opacity=0.25),
+        ),
+    },
+)
+
 
 class G1StairsEnv(DirectRLEnv):
     cfg: G1StairsEnvCfg
@@ -148,8 +179,10 @@ class G1StairsEnv(DirectRLEnv):
         # arm carries no extra buffer. Per-tile step height is deliberately NOT cached here: the
         # curriculum rewrites terrain.env_origins as envs are promoted, so it is recomputed from
         # the live origins on every call.
+        # Built if EITHER the reward arm or the visualization needs it -- the debug markers draw
+        # the same geometry the penalty scores, so they must not depend on the reward being on.
         self._volume_points_pattern: torch.Tensor | None = None
-        if self.cfg.use_volume_points_edge_penalty:
+        if self.cfg.use_volume_points_edge_penalty or self.cfg.debug_vis_foot_points:
             self._volume_points_pattern = self._build_volume_points_pattern()
             print(
                 f"[g1_stairs] volume-point edge penalty ENABLED: "
@@ -185,6 +218,12 @@ class G1StairsEnv(DirectRLEnv):
         self.commands = torch.zeros(self.num_envs, 3, device=self.device)
         self.goal_pos_w = torch.zeros(self.num_envs, 3, device=self.device)
         self.goal_marker = VisualizationMarkers(GOAL_MARKER_CFG) if self.cfg.debug_vis_goal else None
+        self.foot_points_marker = (
+            VisualizationMarkers(FOOT_POINTS_MARKER_CFG) if self.cfg.debug_vis_foot_points else None
+        )
+        self.stair_edge_marker = (
+            VisualizationMarkers(EDGE_CYLINDER_MARKER_CFG) if self.cfg.debug_vis_stair_edges else None
+        )
         self._resample_commands(torch.arange(self.num_envs, device=self.device))
         self._update_position_based_commands()
 
@@ -296,6 +335,7 @@ class G1StairsEnv(DirectRLEnv):
 
         if self.goal_marker is not None:
             self.goal_marker.visualize(translations=self.goal_pos_w)
+        self._update_debug_markers()
 
     @staticmethod
     def _scanner_hit_heights(sensor: RayCaster) -> torch.Tensor:
@@ -423,6 +463,93 @@ class G1StairsEnv(DirectRLEnv):
         distance = torch.sqrt(horizontal * horizontal + vertical * vertical + 1.0e-12)
         depth = torch.clamp(self.cfg.edge_cylinder_radius_m - distance, min=0.0)
         return depth.max(dim=-1).values
+
+    def _stair_edge_segments(self) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Endpoints of every stair edge, as cylinder poses: (M, 3) translations, (M, 4)
+                orientations, (M, 3) scales, where M = num_envs * (num_steps + 1) * 4.
+
+                Each ring k is a square at Chebyshev distance `half_extent - k * tread` from the tile
+                centre, sitting at height `(k + 1) * step_height` -- the same closed-form geometry
+                _stair_edge_penetration_depth scores against, so what is drawn is exactly what is
+                measured. Four straight segments per ring (N/S/E/W sides of the square).
+                """
+        origin = self.terrain.env_origins
+        num_steps = STAIRS_GENERATOR_NUM_STEPS
+        step_height = origin[:, 2] / float(num_steps + 1)
+
+        k = torch.arange(num_steps + 1, device=self.device, dtype=origin.dtype)
+        c = STAIRS_STAIR_REGION_HALF_EXTENT_M - k * STAIRS_TREAD_DEPTH_TRUE_M  # (K,)
+        z = (k + 1.0).unsqueeze(0) * step_height.unsqueeze(-1)                 # (N, K)
+
+        ox = origin[:, 0].unsqueeze(-1)  # (N, 1)
+        oy = origin[:, 1].unsqueeze(-1)
+        cx = c.unsqueeze(0)              # (1, K)
+
+        # (N, K) corner coordinates of each ring
+        x_lo, x_hi = ox - cx, ox + cx
+        y_lo, y_hi = oy - cx, oy + cx
+
+        def seg(p0x, p0y, p1x, p1y):
+            p0 = torch.stack([p0x, p0y, z], dim=-1)  # (N, K, 3)
+            p1 = torch.stack([p1x, p1y, z], dim=-1)
+            return p0.reshape(-1, 3), p1.reshape(-1, 3)
+
+        starts, ends = [], []
+        for a, b in (
+            (( x_lo, y_hi), ( x_hi, y_hi)),   # north
+            (( x_lo, y_lo), ( x_hi, y_lo)),   # south
+            (( x_hi, y_lo), ( x_hi, y_hi)),   # east
+            (( x_lo, y_lo), ( x_lo, y_hi)),   # west
+        ):
+            s, e = seg(a[0].expand_as(z), a[1].expand_as(z), b[0].expand_as(z), b[1].expand_as(z))
+            starts.append(s)
+            ends.append(e)
+        p0 = torch.cat(starts, dim=0)
+        p1 = torch.cat(ends, dim=0)
+
+        translations = 0.5 * (p0 + p1)
+        direction = p1 - p0
+        length = torch.norm(direction, dim=-1)
+        unit = direction / length.clamp(min=1.0e-9).unsqueeze(-1)
+
+        # Rotate the cylinder's own +Z axis onto the segment direction. Every stair edge is
+        # horizontal, so +Z is never parallel to the direction and the cross product is safe.
+        z_axis = torch.zeros_like(unit)
+        z_axis[:, 2] = 1.0
+        axis = torch.cross(z_axis, unit, dim=-1)
+        axis = axis / torch.norm(axis, dim=-1, keepdim=True).clamp(min=1.0e-9)
+        angle = torch.acos(torch.clamp((z_axis * unit).sum(dim=-1), -1.0, 1.0))
+        orientations = quat_from_angle_axis(angle, axis)
+
+        # Rendering-only thinning. The penalty itself always uses the full
+        # edge_cylinder_radius_m -- see debug_vis_edge_radius_scale in the cfg.
+        radius = self.cfg.edge_cylinder_radius_m * self.cfg.debug_vis_edge_radius_scale
+        scales = torch.stack([torch.full_like(length, radius), torch.full_like(length, radius), length], dim=-1)
+        return translations, orientations, scales
+
+    def _update_debug_markers(self):
+        """Draw the edge cylinders and the per-foot sample points. Visualization only."""
+        if self.stair_edge_marker is not None:
+            translations, orientations, scales = self._stair_edge_segments()
+            self.stair_edge_marker.visualize(
+                translations=translations, orientations=orientations, scales=scales
+            )
+
+        if self.foot_points_marker is not None:
+            points_pos_w, _ = self._volume_points_world_state()
+            depth = self._stair_edge_penetration_depth(points_pos_w)
+            points = points_pos_w.reshape(-1, 3)
+            penetrating = (depth.reshape(-1) > 0.0).long()
+            # VisualizationMarkers needs at least one instance of each prototype present, or the
+            # indices get remapped and every point renders in the wrong colour. When nothing is
+            # penetrating, append one throwaway red point far below the terrain (same trick
+            # InstinctLab uses, which parks its dummy at the origin).
+            if not bool(penetrating.any()):
+                sink = points[:1].clone()
+                sink[:, 2] -= 1000.0
+                points = torch.cat([points, sink], dim=0)
+                penetrating = torch.cat([penetrating, torch.ones(1, dtype=torch.long, device=self.device)])
+            self.foot_points_marker.visualize(translations=points, marker_indices=penetrating)
 
     def _randomize_material_properties(self):
         """Randomize friction and restitution once at startup.
