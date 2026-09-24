@@ -117,22 +117,20 @@ _G1_29DOF_SOFT_ARMS_CFG.actuators["waist"].stiffness = 200.0
 _G1_29DOF_SOFT_ARMS_CFG.actuators["waist"].damping = 5.0
 _G1_29DOF_SOFT_ARMS_CFG.spawn.activate_contact_sensors = True
 
-# Self-collision ON (2026-09-16). G1_29DOF_CFG ships this False, so nothing stopped the arms
+# Self-collision OFF, matching the 2026-09-22 winning run.
+#
+# It was turned ON on 2026-09-16 because G1_29DOF_CFG ships it False and nothing stopped the arms
 # passing straight THROUGH the torso, head and legs -- visible in the level-9 pinned video, where
-# the arms reach poses the real robot physically cannot hold and intersect the body. No reward can
-# fix that; it is a physics setting.
+# the arms reach poses the real robot physically cannot hold. That reasoning still stands: this is
+# a physics setting and no reward can substitute for it.
 #
-# Why the arms get thrown around in the first place is separate and NOT fixed here: the arm
-# actuators are deliberately soft (40/10), which is correct -- that value matches Isaac Lab's own
-# G1_MINIMAL_CFG and is what Projects 1 and 2 both use (the stock G1_29DOF_CFG value of 3000 is a
-# mocap position-hold gain, rejected in rl-wbc-g1-amp as "a destabilizing torque source on the
-# torso every step"). Soft arms are fine when something guides them; measured deviation is ~0.62
-# rad/joint, consistent with inertial loads from the current hoppy gait overwhelming a 40 N*m/rad
-# spring rather than with the policy choosing that pose.
-#
-# Costs simulation time -- self-collision pairs are not free. Worth measuring against the previous
-# ~4.2 it/s if throughput drops noticeably.
-_G1_29DOF_SOFT_ARMS_CFG.spawn.articulation_props.enabled_self_collisions = True
+# It was reverted here only as one knob of a three-knob bisection hunting the 09-21 collapse, and
+# the collapse turned out to be rew_feet_air_time alone. So this is OFF for fidelity to the run
+# that actually completed 240k steps, NOT because it was implicated -- there is no evidence it
+# contributed. Turning it back ON is the obvious next cleanup, but it has never been validated in
+# a full-length run, and it costs simulation time (self-collision pairs are not free -- measure
+# against ~4.2 it/s). Change it on its own, not bundled with anything else.
+_G1_29DOF_SOFT_ARMS_CFG.spawn.articulation_props.enabled_self_collisions = False
 
 # DelayedPDActuator is an EXPLICIT actuator model where the stock G1 config uses implicit PhysX
 # PD. Same gains either way (as InstinctLab does it), but the dynamics are not identical -- set
@@ -213,22 +211,23 @@ class G1StairsEnvCfg(DirectRLEnvCfg):
     feet_close_xy_threshold_m = 0.12
     feet_close_xy_std = math.sqrt(0.05)
 
-    # 0.5 -> 2.0 (2026-09-16) to give the gait term enough weight to actually compete.
+    # 2.0 -> 0.5 (2026-09-22). DO NOT raise this again without first fixing the gate.
     #
     # The value this scales is min-over-feet of in-mode time, zeroed unless exactly one foot is in
-    # contact; both current_contact_time and current_air_time reset at every transition, so during
-    # a single-support phase it ramps 0 -> T and its episode mean is f * T/2, where f is the
-    # fraction of time spent in single support. On the 2026-09-16 run it logged 0.0292/step, i.e.
-    # a raw value of 0.058 s. (That does NOT mean 58 ms of single support -- f and T cannot be
-    # separated from one scalar. At f = 20-70%, T is 0.17-0.58 s.)
+    # contact. Critically it is gated on the velocity COMMAND being active, not on actual
+    # displacement (see feet_air_time_cmd_active in g1_stairs_env.py) -- and the command is itself
+    # derived from distance-to-goal. So a policy that marches in place stays far from the goal,
+    # which keeps the command saturated, which keeps this bonus paying: the exploit protects the
+    # very condition that funds it.
     #
-    # Sizing is based on what an IMPROVEMENT buys, not on the current value. Against a net 2.40
-    # reward/step, moving the raw value 0.058 -> 0.20 (a plausible stepping gait) is worth 3.0% of
-    # net at weight 0.5 -- invisible, the policy has no reason to chase it -- and 11.8% at 2.0.
-    # Weight 4.0 would make it dominant (23.6%) and 8.0 invites the obvious hack: stand on one leg
-    # and bank stance time instead of walking (only loosely opposed by dont_wait and the velocity
-    # tracking term, both of which it could partly satisfy while barely moving).
-    rew_feet_air_time = 2.0
+    # At 2.0 that exploit out-earned climbing outright. Step-matched at 66.6k, the failing run took
+    # 45% more reward per step (5.07 vs 3.51) while climbing 21x less (0.034 m vs 0.714 m). The
+    # earlier sizing note here reasoned about what an IMPROVEMENT buys and concluded 2.0 was
+    # "competitive" and only 8.0 risked the stand-in-place hack. That was wrong: it never priced
+    # what the EXPLOIT pays, which the command-gate makes free.
+    #
+    # At 0.5 the exploit stops paying -- it ended the winning run at 0.1% of positive income.
+    rew_feet_air_time = 0.5
     feet_air_time_vel_threshold_mps = 0.15
     rew_feet_slide = -0.4
     rew_energy = -5.0e-5
@@ -580,11 +579,13 @@ class G1StairsEnvCfg_PLAY(G1StairsEnvCfg):
     fields (viewer.asset_name) with a NoneType type-check error."""
 
     def __post_init__(self):
-        self.scene.num_envs = 32
+        self.scene.num_envs = 4
         self.scene.env_spacing = 3.0
         self.debug_vis_goal = True
-        self.debug_vis_foot_points = True
-        self.debug_vis_stair_edges = True
+        # Marker overlays off: scripted level evals want clean footage, and the markers cost
+        # render time per env. Flip either back on to inspect edge/foot geometry.
+        self.debug_vis_foot_points = False
+        self.debug_vis_stair_edges = False
         # Follow-cam by default; play_amp_depth.py --camera fixed swaps this for a static shot.
         self.viewer.origin_type = "asset_root"
         self.viewer.asset_name = "robot"

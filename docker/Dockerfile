@@ -12,6 +12,10 @@ WORKDIR /workspace/rl_wbc_g1
 
 COPY isaaclab_project/ ./isaaclab_project/
 COPY docker/patch_register_task.py ./docker/patch_register_task.py
+# Bake scripts/ in so the image runs standalone. The run wrappers also bind-mount this path,
+# which shadows the baked copy -- that mount is what makes code edits take effect without a
+# rebuild, so it stays. This is the fallback for running the image without the mounts.
+COPY scripts/ ./scripts/
 
 # Real interpreter env var -- respected regardless of whether `python` in this image is a
 # symlink, wrapper script, or shell alias, unlike PATH tricks.
