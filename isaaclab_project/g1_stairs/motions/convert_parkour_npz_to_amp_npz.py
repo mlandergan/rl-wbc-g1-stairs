@@ -157,20 +157,59 @@ def main():
         raise ValueError(f"Body name(s) not in MJCF: "
                          f"{[n for n, b in zip(MJCF_BODY_NAMES, body_ids) if b == -1]}")
 
+    torso_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "torso_link")
+    waist_npz_indices = [
+        npz_joint_names.index(wn)
+        for wn in ("waist_yaw_joint", "waist_roll_joint", "waist_pitch_joint")
+        if wn in npz_joint_names
+    ]
+
     nb = len(BODY_NAMES)
     seg_dof_pos, seg_body_pos, seg_body_rot = [], [], []
     seg_dof_vel, seg_body_lin, seg_body_ang = [], [], []
 
     for s, e in kept:
         n = e - s
-        dof_pos = joint_pos_all[s:e]
+        dof_pos = joint_pos_all[s:e].copy()
+        # Source frames 0..2975 come from InstinctLab's torso-rooted G1_29DOF_TORSOBASE_POPSICLE_CFG,
+        # where base_pos_w and base_quat_w are torso_link's world pose and the waist joints rotate
+        # from torso_link (parent) to pelvis (child). Negate the waist joints for our pelvis-rooted
+        # model and solve for the pelvis freejoint pose that places torso_link at (base_pos_w, base_quat_w).
+        is_torso_rooted = (e <= 2975) and (torso_id != -1)
+        if is_torso_rooted:
+            dof_pos[:, waist_npz_indices] *= -1.0
+
         body_pos = np.zeros((n, nb, 3))
         body_rot = np.zeros((n, nb, 4))
         for t in range(n):
             qpos = np.zeros(model.nq)
-            qpos[0:3] = base_pos_all[s + t]
-            qpos[3:7] = base_quat_all[s + t]
             qpos[7:] = dof_pos[t][to_mjcf]
+            if is_torso_rooted:
+                qpos[0:3] = 0.0
+                qpos[3:7] = [1.0, 0.0, 0.0, 0.0]
+                data.qpos[:] = qpos
+                mujoco.mj_forward(model, data)
+                p_p2t = data.xpos[torso_id].copy()
+                q_p2t = data.xquat[torso_id].copy()
+                # q_pelvis = q_torso_w * inv(q_p2t)
+                w1, x1, y1, z1 = base_quat_all[s + t]
+                w2, x2, y2, z2 = q_p2t[0], -q_p2t[1], -q_p2t[2], -q_p2t[3]
+                q_pelvis = np.array([
+                    w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2,
+                    w1 * x2 + x1 * w2 + y1 * z2 - z1 * y2,
+                    w1 * y2 - x1 * z2 + y1 * w2 + z1 * x2,
+                    w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2,
+                ])
+                q_pelvis /= max(np.linalg.norm(q_pelvis), 1e-12)
+                qv = q_pelvis[1:]
+                uv = np.cross(qv, p_p2t)
+                uuv = np.cross(qv, uv)
+                p_pelvis = base_pos_all[s + t] - (p_p2t + 2.0 * (q_pelvis[0] * uv + uuv))
+                qpos[0:3] = p_pelvis
+                qpos[3:7] = q_pelvis
+            else:
+                qpos[0:3] = base_pos_all[s + t]
+                qpos[3:7] = base_quat_all[s + t]
             data.qpos[:] = qpos
             mujoco.mj_forward(model, data)
             for j, bid in enumerate(body_ids):
