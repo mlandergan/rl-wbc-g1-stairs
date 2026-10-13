@@ -181,9 +181,10 @@ class G1StairsEnv(DirectRLEnv):
         # the live origins on every call.
         # Built if EITHER the reward arm or the visualization needs it -- the debug markers draw
         # the same geometry the penalty scores, so they must not depend on the reward being on.
-        self._volume_points_pattern: torch.Tensor | None = None
-        if self.cfg.use_volume_points_edge_penalty or self.cfg.debug_vis_foot_points:
-            self._volume_points_pattern = self._build_volume_points_pattern()
+        # Foot volume points: always constructed so that evaluation (eval_levels.py) and
+        # telemetry can measure exact 3D edge penetration across all ablation modes.
+        self._volume_points_pattern: torch.Tensor = self._build_volume_points_pattern()
+        if self.cfg.use_volume_points_edge_penalty:
             print(
                 f"[g1_stairs] volume-point edge penalty ENABLED: "
                 f"{self._volume_points_pattern.shape[0]} points/foot "
@@ -191,6 +192,11 @@ class G1StairsEnv(DirectRLEnv):
                 f"{self.cfg.edge_cylinder_radius_m:.3f} m, "
                 f"{STAIRS_GENERATOR_NUM_STEPS + 1} edge rings/tile, "
                 f"tread {STAIRS_TREAD_DEPTH_TRUE_M:.4f} m"
+            )
+        else:
+            print(
+                f"[g1_stairs] volume-point edge penalty DISABLED (single-point mode active, "
+                f"volume points available for telemetry)"
             )
 
         self.termination_contact_body_indexes = []
@@ -255,6 +261,16 @@ class G1StairsEnv(DirectRLEnv):
         # Sticky per-episode flag: did this env ever get within the arrival threshold of its goal?
         # Drives terrain-curriculum promotion together with climb fraction. Reset in _reset_idx.
         self._episode_reached_goal = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+
+        # Per-env lead-foot tracking for step-over-step alternation (0 = right, 1 = left, -1 = none yet).
+        self._last_lead_foot = torch.full((self.num_envs,), -1, dtype=torch.long, device=self.device)
+        self._last_stair_lead_foot = torch.full((self.num_envs,), -1, dtype=torch.long, device=self.device)
+        self._max_stair_idx_reached = torch.full((self.num_envs,), -1, dtype=torch.long, device=self.device)
+        self._stair_step_repeated_lead = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        self._lead_foot_duration = torch.zeros(self.num_envs, dtype=torch.float32, device=self.device)
+        self._foot_planted_stair_idx = torch.full((self.num_envs, 2), -1, dtype=torch.long, device=self.device)
+        self._prev_feet_air_time = torch.zeros((self.num_envs, 2), dtype=torch.float32, device=self.device)
+        self._inplace_step_latched = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
 
         # Per-cause termination diagnostics, populated by _get_dones and logged by _get_rewards.
         # Initialized here because _get_rewards can run before _get_dones has ever filled it.
@@ -330,7 +346,22 @@ class G1StairsEnv(DirectRLEnv):
             r.command_pos_k_w * torch.atan2(y_g, x_g), min=-r.command_ang_vel_z_max, max=r.command_ang_vel_z_max
         )
 
-        arrived = torch.norm(goal_vec_w[:, :2], dim=1) <= r.command_target_dist_threshold_m
+        feet_pos_xy = self.robot.data.body_pos_w[:, self.feet_body_indexes, :2]
+        origin_xy = self.terrain.env_origins[:, :2].unsqueeze(1)
+        cheb_feet = torch.maximum(
+            torch.abs(feet_pos_xy[..., 0] - origin_xy[..., 0]),
+            torch.abs(feet_pos_xy[..., 1] - origin_xy[..., 1]),
+        )
+        platform_half_w = STAIRS_STAIR_REGION_HALF_EXTENT_M - STAIRS_GENERATOR_NUM_STEPS * STAIRS_TREAD_DEPTH_TRUE_M
+        both_feet_on_platform = cheb_feet.max(dim=1).values <= (platform_half_w - 0.03)
+        pelvis_near_goal = torch.norm(goal_vec_w[:, :2], dim=1) <= r.command_target_dist_threshold_m
+
+        # Keep a gentle forward command if the pelvis is at the goal threshold but the trailing
+        # foot is still on the last stair step, so both feet finish on the top platform.
+        straddling_top_edge = pelvis_near_goal & (~both_feet_on_platform)
+        self.commands[straddling_top_edge, 0] = torch.clamp(self.commands[straddling_top_edge, 0], min=0.22)
+
+        arrived = pelvis_near_goal & both_feet_on_platform
         self.commands[arrived] = 0.0
 
         if self.goal_marker is not None:
@@ -373,9 +404,9 @@ class G1StairsEnv(DirectRLEnv):
         d = torch.maximum(torch.abs(pos_w[..., 0] - origin_x), torch.abs(pos_w[..., 1] - origin_y))
         d_prime = STAIRS_STAIR_REGION_HALF_EXTENT_M - d
 
-        num_edge_lines = int(math.ceil(STAIRS_STAIR_REGION_HALF_EXTENT_M / STAIRS_TREAD_DEPTH_ACTUAL_M)) + 1
+        num_edge_lines = int(math.ceil(STAIRS_STAIR_REGION_HALF_EXTENT_M / STAIRS_TREAD_DEPTH_TRUE_M)) + 1
         k = torch.arange(num_edge_lines, device=pos_w.device, dtype=pos_w.dtype)
-        edge_positions = k * STAIRS_TREAD_DEPTH_ACTUAL_M
+        edge_positions = k * STAIRS_TREAD_DEPTH_TRUE_M
         dist_to_each_edge = torch.abs(d_prime.unsqueeze(-1) - edge_positions)
         return dist_to_each_edge.min(dim=-1).values
 
@@ -463,6 +494,82 @@ class G1StairsEnv(DirectRLEnv):
         distance = torch.sqrt(horizontal * horizontal + vertical * vertical + 1.0e-12)
         depth = torch.clamp(self.cfg.edge_cylinder_radius_m - distance, min=0.0)
         return depth.max(dim=-1).values
+
+    def _stair_tread_containment_violation(
+        self, points_pos_w: torch.Tensor, feet_pos_w: torch.Tensor
+    ) -> torch.Tensor:
+        """Monotonic heel-overhang and toe-riser violation for volume points on stair treads.
+
+        Unlike the 3.5 cm edge cylinder (whose depth drops back to 0 once a heel point hangs
+        more than 3.5 cm off the step lip into mid-air), `heel_overhang` grows linearly with
+        how far a point extends behind `lip_inward + heel_overhang_margin_m`, providing a
+        strictly monotonic gradient that pulls the entire foot onto the tread.
+        """
+        origin = self.terrain.env_origins
+        num_steps = STAIRS_GENERATOR_NUM_STEPS
+        step_height = origin[:, 2] / float(num_steps + 1)
+
+        origin_x_pts = origin[:, 0].view(-1, 1, 1)
+        origin_y_pts = origin[:, 1].view(-1, 1, 1)
+        cheb_pts = torch.maximum(
+            torch.abs(points_pos_w[..., 0] - origin_x_pts),
+            torch.abs(points_pos_w[..., 1] - origin_y_pts),
+        )
+        inward_pts = STAIRS_STAIR_REGION_HALF_EXTENT_M - cheb_pts  # (N, 2, P)
+
+        # Geometric center of the 100-point sole grid (X = +0.038m ahead of ankle, half-length = 0.104m)
+        inward_center = inward_pts.mean(dim=-1)  # (N, 2)
+        k_center = torch.floor(inward_center / STAIRS_TREAD_DEPTH_TRUE_M)
+        sole_z = points_pos_w[..., 2].min(dim=-1).values  # (N, 2)
+
+        # Strictly on an elevated stair tread (excludes flat spawn floor and top platform)
+        on_stair_tread = (
+            (k_center >= 0.0)
+            & (k_center < float(num_steps))
+            & (sole_z > 0.4 * step_height.unsqueeze(1))
+        )
+        k_support = torch.clamp(k_center, min=0.0, max=float(num_steps - 1))
+
+        lip_inward = (k_support * STAIRS_TREAD_DEPTH_TRUE_M).unsqueeze(-1)  # (N, 2, 1)
+        riser_inward = ((k_support + 1.0) * STAIRS_TREAD_DEPTH_TRUE_M).unsqueeze(-1)  # (N, 2, 1)
+
+        heel_overhang = torch.clamp(
+            (lip_inward + self.cfg.heel_overhang_margin_m) - inward_pts, min=0.0, max=0.12
+        )
+        toe_violation = torch.clamp(
+            inward_pts - (riser_inward - self.cfg.toe_riser_margin_m), min=0.0, max=0.12
+        )
+
+        violation = torch.maximum(1.5 * heel_overhang, toe_violation)
+        return violation * on_stair_tread.unsqueeze(-1).float()
+
+    def _stair_edge_swing_lip_drag(self, points_pos_w: torch.Tensor) -> torch.Tensor:
+        """Depth each point has penetrated a stair-edge cylinder at or below the step lip.
+
+        Points clearing above the step lip (`vertical >= swing_edge_lip_margin_m`) return 0,
+        while a swing foot scraping up the riser face or clipping the step nose returns its
+        penetration depth.
+        """
+        origin = self.terrain.env_origins
+        num_steps = STAIRS_GENERATOR_NUM_STEPS
+        step_height = origin[:, 2] / float(num_steps + 1)
+
+        origin_x = origin[:, 0].view(-1, 1, 1)
+        origin_y = origin[:, 1].view(-1, 1, 1)
+        cheb = torch.maximum(
+            torch.abs(points_pos_w[..., 0] - origin_x), torch.abs(points_pos_w[..., 1] - origin_y)
+        )
+        inward = STAIRS_STAIR_REGION_HALF_EXTENT_M - cheb
+
+        k = torch.arange(num_steps + 1, device=points_pos_w.device, dtype=points_pos_w.dtype)
+        horizontal = inward.unsqueeze(-1) - k * STAIRS_TREAD_DEPTH_TRUE_M
+        edge_z = (k + 1.0).view(1, 1, 1, -1) * step_height.view(-1, 1, 1, 1)
+        vertical = points_pos_w[..., 2].unsqueeze(-1) - edge_z
+
+        distance = torch.sqrt(horizontal * horizontal + vertical * vertical + 1.0e-12)
+        depth = torch.clamp(self.cfg.edge_cylinder_radius_m - distance, min=0.0)
+        below_lip = (vertical < self.cfg.swing_edge_lip_margin_m).float()
+        return (depth * below_lip).max(dim=-1).values
 
     def _stair_edge_segments(self) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Endpoints of every stair edge, as cylinder poses: (M, 3) translations, (M, 4)
@@ -774,7 +881,7 @@ class G1StairsEnv(DirectRLEnv):
             self.prev_actions,
             self.robot.data.projected_gravity_b,
             joint_acc_29,
-            applied_torque_29[:, self.hip_knee_ankle_dof_indexes],
+            applied_torque_29,
             joint_pos_29[:, self.ankle_dof_indexes],
             soft_limits_29[:, self.ankle_dof_indexes],
             joint_pos_29[:, self.hip_deviation_dof_indexes] - default_joint_pos_29[:, self.hip_deviation_dof_indexes],
@@ -802,29 +909,39 @@ class G1StairsEnv(DirectRLEnv):
             per_foot.append(torch.sum(clearance * feet_in_contact[:, col].unsqueeze(-1).float(), dim=-1))
         rew_feet_height_error = self.cfg.rew_feet_height_error * (per_foot[0] + per_foot[1])
 
+        points_pos_w, points_vel_w = self._volume_points_world_state()
+
         # Exclusive ablation arms -- exactly one edge term is ever applied.
         if self.cfg.use_volume_points_edge_penalty:
-            # Volume-point arm. No contact gate: penetration is measured geometrically, so a swing
-            # foot clipping through an edge is penalised even though it registers no contact force
-            # (the single-point arm below cannot see that case at all). Velocity weighting is what
-            # keeps a foot resting still against an edge cheap while one driving through it is not.
-            points_pos_w, points_vel_w = self._volume_points_world_state()
+            # Volume-point arm with contact gating, monotonic tread-containment (heel overhang &
+            # toe-to-riser clearance), and terrain-level curriculum ramp.
             penetration_depth = self._stair_edge_penetration_depth(points_pos_w)
-            points_speed = torch.norm(points_vel_w, dim=-1)
-            in_obstacle = (penetration_depth > 0.0).float()
-            penetration_cost = in_obstacle * (points_speed + 1.0e-6) * penetration_depth
-            rew_edge_penetration = self.cfg.rew_volume_points_penetration * torch.sum(
-                penetration_cost.flatten(start_dim=1), dim=1
+            tread_violation = self._stair_tread_containment_violation(points_pos_w, feet_pos_w)
+            combined_violation = torch.maximum(penetration_depth, tread_violation)
+            penetration_contact = combined_violation * feet_in_contact.unsqueeze(-1).float()
+
+            level_progress = torch.clamp((self.terrain.terrain_levels.float() - 1.0) / 5.0, min=0.0, max=1.0)
+            edge_curriculum_scale = 1.0 + (self.cfg.edge_penalty_curriculum_max_scale - 1.0) * level_progress
+
+            per_foot_violation = (
+                penetration_contact.max(dim=-1).values + 2.0 * penetration_contact.mean(dim=-1)
+            )
+            rew_edge_penetration = (
+                self.cfg.rew_volume_points_penetration
+                * edge_curriculum_scale
+                * torch.sum(per_foot_violation, dim=1)
             )
             self._edge_diag = {
-                "diag_edge_points_penetrating": in_obstacle.flatten(start_dim=1).sum(dim=1).mean(),
-                "diag_edge_max_penetration_m": penetration_depth.flatten(start_dim=1).max(dim=1).values.mean(),
+                "diag_edge_points_penetrating": (
+                    (penetration_contact > 0.0).float().flatten(start_dim=1).sum(dim=1).mean()
+                ),
+                "diag_edge_max_penetration_m": combined_violation.flatten(start_dim=1).max(dim=1).values.mean(),
+                "diag_edge_contact_penetration_m": penetration_contact.flatten(start_dim=1).max(dim=1).values.mean(),
             }
         else:
             edge_violation = torch.clamp(self.cfg.edge_safety_margin_m - edge_dist, min=0.0)
-            feet_speed = torch.norm(feet_vel_w, dim=-1)
             rew_edge_penetration = self.cfg.rew_edge_penetration * torch.sum(
-                edge_violation * (feet_speed + 1.0e-3) * feet_in_contact.float(), dim=1
+                edge_violation * feet_in_contact.float(), dim=1
             )
             self._edge_diag = {}
 
@@ -838,11 +955,18 @@ class G1StairsEnv(DirectRLEnv):
         feet_air_time_value = torch.min(
             torch.where(single_stance.unsqueeze(-1), in_mode_time, torch.zeros_like(in_mode_time)), dim=1
         )[0]
+        feet_air_time_value = torch.clamp(feet_air_time_value, max=0.5)
         feet_air_time_cmd_active = torch.logical_or(
             torch.norm(self.commands[:, :2], dim=1) > self.cfg.feet_air_time_vel_threshold_mps,
             torch.abs(self.commands[:, 2]) > self.cfg.feet_air_time_vel_threshold_mps,
         )
-        rew_feet_air_time = self.cfg.rew_feet_air_time * feet_air_time_value * feet_air_time_cmd_active.float()
+        moving_forward_now = self.robot.data.root_lin_vel_b[:, 0] > 0.10
+        valid_swing_duration = torch.max(feet_air_time, dim=1)[0] < 0.65
+        rew_feet_air_time = (
+            self.cfg.rew_feet_air_time
+            * feet_air_time_value
+            * (feet_air_time_cmd_active & moving_forward_now & valid_swing_duration).float()
+        )
 
         heading = self.robot.data.heading_w
         cos_h, sin_h = torch.cos(heading), torch.sin(heading)
@@ -858,6 +982,248 @@ class G1StairsEnv(DirectRLEnv):
 
         feet_planar_speed = torch.norm(feet_vel_w[..., :2], dim=-1)
         rew_feet_slide = self.cfg.rew_feet_slide * torch.sum(feet_planar_speed * feet_in_contact.float(), dim=1)
+
+        # Same-step & in-place step penalty:
+        # 1. Latches each foot's planted stair index (`_foot_planted_stair_idx`) so lifting one foot
+        #    into the air after double-stepping cannot clear the penalty until a foot advances to a
+        #    higher stair.
+        # 2. Detects any redundant touchdown on the stairs (`redundant_stair_touchdown`): either a
+        #    foot lifting (>0.03 s air time) and landing back on its own stair (in-place step/tap)
+        #    or landing on the same stair the other foot is planted on.
+        origin = self.terrain.env_origins
+        cheb_feet = torch.maximum(
+            torch.abs(feet_pos_w[..., 0] - origin[:, 0].unsqueeze(1)),
+            torch.abs(feet_pos_w[..., 1] - origin[:, 1].unsqueeze(1)),
+        )
+        inward_feet = STAIRS_STAIR_REGION_HALF_EXTENT_M - cheb_feet
+        stair_idx_feet = torch.floor(inward_feet / STAIRS_TREAD_DEPTH_TRUE_M).long()
+        stairs_max_inward = STAIRS_GENERATOR_NUM_STEPS * STAIRS_TREAD_DEPTH_TRUE_M
+        on_stairs = (inward_feet >= 0.0) & (inward_feet < stairs_max_inward)
+
+        clamped_stair_idx = torch.clamp(stair_idx_feet, min=-1, max=STAIRS_GENERATOR_NUM_STEPS)
+        inward_into_tread_all = inward_feet - stair_idx_feet.float() * STAIRS_TREAD_DEPTH_TRUE_M
+        clean_tread_contact = feet_in_contact & ((~on_stairs) | (inward_into_tread_all > 0.02))
+        foot_just_landed_on_stairs = (
+            clean_tread_contact
+            & on_stairs
+            & (self._prev_feet_air_time > 0.03)
+            & (self.episode_length_buf > 3).unsqueeze(1)
+        )
+
+        inplace_touchdown_r = foot_just_landed_on_stairs[:, 0] & (
+            clamped_stair_idx[:, 0] == self._foot_planted_stair_idx[:, 0]
+        )
+        inplace_touchdown_l = foot_just_landed_on_stairs[:, 1] & (
+            clamped_stair_idx[:, 1] == self._foot_planted_stair_idx[:, 1]
+        )
+        partner_same_touchdown_r = foot_just_landed_on_stairs[:, 0] & (
+            clamped_stair_idx[:, 0] == self._foot_planted_stair_idx[:, 1]
+        )
+        partner_same_touchdown_l = foot_just_landed_on_stairs[:, 1] & (
+            clamped_stair_idx[:, 1] == self._foot_planted_stair_idx[:, 0]
+        )
+        redundant_stair_touchdown = (
+            inplace_touchdown_r | inplace_touchdown_l | partner_same_touchdown_r | partner_same_touchdown_l
+        )
+
+        max_planted_before = torch.maximum(self._foot_planted_stair_idx[:, 0], self._foot_planted_stair_idx[:, 1])
+        advanced_stair_touchdown = (
+            (clean_tread_contact[:, 0] & (clamped_stair_idx[:, 0] > max_planted_before))
+            | (clean_tread_contact[:, 1] & (clamped_stair_idx[:, 1] > max_planted_before))
+        )
+        reached_platform_foot = (clamped_stair_idx[:, 0] >= STAIRS_GENERATOR_NUM_STEPS) | (
+            clamped_stair_idx[:, 1] >= STAIRS_GENERATOR_NUM_STEPS
+        )
+
+        self._foot_planted_stair_idx = torch.where(
+            clean_tread_contact, clamped_stair_idx, self._foot_planted_stair_idx
+        )
+        self._prev_feet_air_time = feet_air_time.clone()
+
+        self._inplace_step_latched = torch.where(
+            advanced_stair_touchdown | reached_platform_foot,
+            torch.zeros_like(self._inplace_step_latched),
+            self._inplace_step_latched | redundant_stair_touchdown,
+        )
+
+        planted_on_same_stair = (
+            (self._foot_planted_stair_idx[:, 0] >= 0)
+            & (self._foot_planted_stair_idx[:, 0] < STAIRS_GENERATOR_NUM_STEPS)
+            & (self._foot_planted_stair_idx[:, 0] == self._foot_planted_stair_idx[:, 1])
+        )
+        same_step_active = (
+            (planted_on_same_stair | self._inplace_step_latched)
+            & (~reached_platform_foot)
+            & feet_air_time_cmd_active
+        )
+        rew_same_step_penalty = self.cfg.rew_same_step_penalty * (
+            same_step_active.float() + 4.0 * redundant_stair_touchdown.float()
+        )
+
+        # Hard anti-jump / no-flight penalty: at least one foot must remain in contact at all times
+        # after initial spawn settling (episode_length_buf > 3). Uses > 0.03 s air time (> 1 step)
+        # to ignore 1-frame contact-sensor chatter while penalizing any real hop/flight phase, and
+        # also penalizes holding a single foot in the air > 0.85 s ("flamingo" one-legged standing).
+        both_feet_in_air = (feet_air_time[:, 0] > 0.03) & (feet_air_time[:, 1] > 0.03) & (self.episode_length_buf > 3)
+        flamingo_air = (torch.max(feet_air_time, dim=1)[0] > 0.85) & feet_air_time_cmd_active
+        rew_both_feet_air = self.cfg.rew_both_feet_air * both_feet_in_air.float() - 2.0 * flamingo_air.float()
+
+        # --- Trailing-foot drag penalty ---------------------------------------------------------
+        # Forward foot offset and velocity along the robot's heading direction (right = 0, left = 1)
+        root_pos_xy = self.robot.data.root_pos_w[:, :2].unsqueeze(1)
+        feet_rel_xy = feet_pos_w[..., :2] - root_pos_xy
+        feet_fwd = cos_h.unsqueeze(-1) * feet_rel_xy[..., 0] + sin_h.unsqueeze(-1) * feet_rel_xy[..., 1]
+        feet_vel_fwd = cos_h.unsqueeze(-1) * feet_vel_w[..., 0] + sin_h.unsqueeze(-1) * feet_vel_w[..., 1]
+
+        # Swing-foot riser/lip drag: volume points of a forward-moving swing foot penetrating the 5 cm
+        # stair edge cylinder at or below the step lip (`vertical < swing_edge_lip_margin_m`).
+        swing_lip_depth = self._stair_edge_swing_lip_drag(points_pos_w)
+        swing_forward_mask = (~feet_in_contact) & (feet_vel_fwd > 0.0)
+        swing_edge_drag_per_foot = (
+            swing_lip_depth.max(dim=-1).values + 0.05 * swing_lip_depth.sum(dim=-1)
+        ) * swing_forward_mask.float()
+        trailing_foot_drag_raw = swing_edge_drag_per_foot[:, 0] + swing_edge_drag_per_foot[:, 1]
+        rew_trailing_foot_drag = self.cfg.rew_trailing_foot_drag * trailing_foot_drag_raw
+
+        # --- Lead-leg alternation reward & repeat-lead penalty (scoped to stairs) ---------------
+        stair_level_feet = torch.clamp(stair_idx_feet, min=-1, max=STAIRS_GENERATOR_NUM_STEPS)
+        inward_into_tread = inward_feet - stair_idx_feet.float() * STAIRS_TREAD_DEPTH_TRUE_M
+        on_stairs_or_platform = stair_level_feet >= 0
+        valid_stair_plant = feet_in_contact & on_stairs_or_platform & (inward_into_tread > 0.035)
+
+        # A foot claims the lead on the stairs when planted in contact on a higher stair (and physically
+        # ahead/higher), or planted > lead_foot_margin_m ahead on the same stair level.
+        right_ahead = (
+            (stair_level_feet[:, 0] > stair_level_feet[:, 1])
+            & ((feet_fwd[:, 0] - feet_fwd[:, 1]) > 0.04)
+            & (feet_pos_w[:, 0, 2] > feet_pos_w[:, 1, 2] + 0.02)
+        ) | (
+            (stair_level_feet[:, 0] == stair_level_feet[:, 1])
+            & ((feet_fwd[:, 0] - feet_fwd[:, 1]) > self.cfg.lead_foot_margin_m)
+        )
+        left_ahead = (
+            (stair_level_feet[:, 1] > stair_level_feet[:, 0])
+            & ((feet_fwd[:, 1] - feet_fwd[:, 0]) > 0.04)
+            & (feet_pos_w[:, 1, 2] > feet_pos_w[:, 0, 2] + 0.02)
+        ) | (
+            (stair_level_feet[:, 1] == stair_level_feet[:, 0])
+            & ((feet_fwd[:, 1] - feet_fwd[:, 0]) > self.cfg.lead_foot_margin_m)
+        )
+        right_leading_now = valid_stair_plant[:, 0] & right_ahead
+        left_leading_now = valid_stair_plant[:, 1] & left_ahead
+
+        last_was_right = self._last_lead_foot == 0
+        last_was_left = self._last_lead_foot == 1
+
+        # Track how long the current stair lead foot has held the lead since planting on the stairs.
+        self._lead_foot_duration = torch.where(
+            feet_air_time_cmd_active & (self._last_lead_foot >= 0),
+            self._lead_foot_duration + self.step_dt,
+            torch.zeros_like(self._lead_foot_duration),
+        )
+
+        # Repeat-lead swing: lifting and moving the ALREADY-leading foot forward again after it has
+        # held the stair lead for > 0.16 s, without the trailing foot having stepped past it.
+        # Does NOT require the other foot to be in contact, so jumping cannot bypass this check.
+        repeat_swing_right = (
+            last_was_right
+            & (self._lead_foot_duration > 0.16)
+            & (~feet_in_contact[:, 0])
+            & (feet_vel_fwd[:, 0] > 0.08)
+        )
+        repeat_swing_left = (
+            last_was_left
+            & (self._lead_foot_duration > 0.16)
+            & (~feet_in_contact[:, 1])
+            & (feet_vel_fwd[:, 1] > 0.08)
+        )
+        repeat_lead_swing = (repeat_swing_right | repeat_swing_left) & feet_air_time_cmd_active
+
+        # Alternating swing progress (strictly in single support -- never during flight!):
+        # Trailing foot swinging forward while the previous lead foot stays planted in stance.
+        alt_swing_left = (
+            last_was_right
+            & feet_in_contact[:, 0]
+            & (~feet_in_contact[:, 1])
+            & (feet_vel_fwd[:, 1] > 0.05)
+        )
+        alt_swing_right = (
+            last_was_left
+            & feet_in_contact[:, 1]
+            & (~feet_in_contact[:, 0])
+            & (feet_vel_fwd[:, 0] > 0.05)
+        )
+        left_crossed_front = torch.where(feet_fwd[:, 1] > feet_fwd[:, 0], 1.5, 0.5)
+        right_crossed_front = torch.where(feet_fwd[:, 0] > feet_fwd[:, 1], 1.5, 0.5)
+        alt_swing_vel = torch.where(
+            alt_swing_left,
+            left_crossed_front * torch.clamp(feet_vel_fwd[:, 1], min=0.0, max=0.6),
+            torch.where(
+                alt_swing_right,
+                right_crossed_front * torch.clamp(feet_vel_fwd[:, 0], min=0.0, max=0.6),
+                torch.zeros_like(feet_vel_fwd[:, 0]),
+            ),
+        )
+
+        # Monotonic stair step-up alternation tracking (fires at most once per stair level 0..6)
+        right_new_stair = right_leading_now & (stair_level_feet[:, 0] > self._max_stair_idx_reached)
+        left_new_stair = left_leading_now & (stair_level_feet[:, 1] > self._max_stair_idx_reached) & (~right_new_stair)
+        reached_new_stair = right_new_stair | left_new_stair
+        new_stair_leader = torch.where(
+            right_new_stair,
+            torch.zeros_like(self._last_stair_lead_foot),
+            torch.ones_like(self._last_stair_lead_foot),
+        )
+
+        has_prev_stair_leader = self._last_stair_lead_foot >= 0
+        first_stair_reached = reached_new_stair & (~has_prev_stair_leader)
+        alternated_on_new_stair = (
+            reached_new_stair & has_prev_stair_leader & (new_stair_leader != self._last_stair_lead_foot)
+        )
+        repeated_on_new_stair = (
+            reached_new_stair & has_prev_stair_leader & (new_stair_leader == self._last_stair_lead_foot)
+        )
+
+        self._stair_step_repeated_lead = torch.where(
+            alternated_on_new_stair,
+            torch.zeros_like(self._stair_step_repeated_lead),
+            torch.where(
+                repeated_on_new_stair,
+                torch.ones_like(self._stair_step_repeated_lead),
+                self._stair_step_repeated_lead,
+            ),
+        )
+        new_stair_level_val = torch.where(right_new_stair, stair_level_feet[:, 0], stair_level_feet[:, 1])
+        self._max_stair_idx_reached = torch.where(
+            reached_new_stair, new_stair_level_val, self._max_stair_idx_reached
+        )
+        self._last_stair_lead_foot = torch.where(
+            reached_new_stair, new_stair_leader, self._last_stair_lead_foot
+        )
+
+        alternated_lead_touchdown = (
+            (right_leading_now & last_was_left) | (left_leading_now & last_was_right)
+        ) & feet_air_time_cmd_active
+        self._lead_foot_duration = torch.where(
+            alternated_lead_touchdown | (right_leading_now & (~last_was_right)) | (left_leading_now & (~last_was_left)),
+            torch.zeros_like(self._lead_foot_duration),
+            self._lead_foot_duration,
+        )
+
+        self._last_lead_foot = torch.where(
+            right_leading_now,
+            torch.zeros_like(self._last_lead_foot),
+            torch.where(left_leading_now, torch.ones_like(self._last_lead_foot), self._last_lead_foot),
+        )
+
+        repeat_lead_active = repeat_lead_swing & (self._max_stair_idx_reached >= 0) & feet_air_time_cmd_active
+        alternated_step_active = (self._max_stair_idx_reached >= 1) & (~self._stair_step_repeated_lead)
+
+        # Strictly monotonic: pays ONLY on reaching a new higher stair (never on same-stair swaps).
+        rew_lead_alternation = self.cfg.rew_lead_alternation * (
+            0.5 * first_stair_reached.float() + alternated_on_new_stair.float()
+        )
+        rew_repeat_lead_penalty = self.cfg.rew_repeat_lead_penalty * repeat_lead_active.float()
 
         power_full = self.robot.data.applied_torque * self.robot.data.joint_vel
         for actuator in self.robot.actuators.values():
@@ -891,7 +1257,7 @@ class G1StairsEnv(DirectRLEnv):
         lin_vel_cmd_x = self.commands[:, 0]
         lin_vel_x_b = self.robot.data.root_lin_vel_b[:, 0]
         dont_wait_count = (
-            (lin_vel_x_b < 0.15).float() + (lin_vel_x_b < 0.0).float() + (lin_vel_x_b < -0.15).float()
+            (lin_vel_x_b < 0.10).float() + (lin_vel_x_b < 0.0).float() + (lin_vel_x_b < -0.15).float()
         )
         rew_dont_wait = self.cfg.rew_dont_wait * (
             lin_vel_cmd_x > self.cfg.dont_wait_cmd_threshold_mps
@@ -902,7 +1268,11 @@ class G1StairsEnv(DirectRLEnv):
             (torch.norm(self.commands[:, :2], dim=1) < self.cfg.stand_still_cmd_threshold).float()
             * (torch.abs(self.commands[:, 2]) < self.cfg.stand_still_cmd_threshold).float()
         )
-        rew_stand_still = self.cfg.rew_stand_still * (dof_error - self.cfg.stand_still_offset) * standing_mask
+        rew_stand_still = (
+            self.cfg.rew_stand_still
+            * torch.clamp(dof_error - self.cfg.stand_still_offset, min=0.0)
+            * standing_mask
+        )
 
         height_rel_to_goal = self.robot.data.root_pos_w[:, 2] - self.terrain.env_origins[:, 2]
         rew_max_height = self.cfg.rew_max_height * height_rel_to_goal
@@ -917,13 +1287,30 @@ class G1StairsEnv(DirectRLEnv):
             torch.square(torso_projected_gravity[:, :2]), dim=1
         )
 
-        # Height-progress reward: pay only for new maximum root height above this episode's spawn
-        # height. Sums per episode to (weight * total height climbed); clamped to new-max-only so
-        # it can't be farmed by bouncing, and zero while flat or descending.
+        # Height-progress reward: pay only for new maximum root height above this episode's settled
+        # spawn height. Sums per episode to (weight * total height climbed); clamped to new-max-only
+        # so it can't be farmed by bouncing, and zero while flat or descending.
+        # Record minimum root_z over the first 8 steps (flat border settling) so Step 0 & Step 1
+        # on Level 0 immediately register positive climb.
+        settling = self.episode_length_buf <= 8
+        self._episode_start_root_z = torch.where(
+            settling,
+            torch.minimum(self._episode_start_root_z, self.robot.data.root_pos_w[:, 2]),
+            self._episode_start_root_z,
+        )
         climb_now = self.robot.data.root_pos_w[:, 2] - self._episode_start_root_z
         new_climb = torch.clamp(climb_now - self._episode_max_climb, min=0.0)
         self._episode_max_climb = torch.maximum(self._episode_max_climb, climb_now)
-        rew_height_progress = self.cfg.rew_height_progress * new_climb
+        climb_lead_scale = torch.where(
+            self._stair_step_repeated_lead,
+            torch.full_like(new_climb, self.cfg.repeat_lead_climb_scale),
+            torch.where(
+                alternated_step_active,
+                torch.full_like(new_climb, 1.5),
+                torch.ones_like(new_climb),
+            ),
+        )
+        rew_height_progress = self.cfg.rew_height_progress * new_climb * climb_lead_scale
 
         rew_is_alive = self.cfg.rew_is_alive * (~self.reset_terminated).float()
 
@@ -933,12 +1320,23 @@ class G1StairsEnv(DirectRLEnv):
         self._track_score_sum += torch.exp(-lin_vel_err_for_curriculum / self.cfg.rew_track_sigma)
 
         total_reward = (
-            total_reward + rew_feet_height_error + rew_edge_penetration + rew_dont_wait + rew_stand_still
+            total_reward
+            + rew_feet_height_error + rew_edge_penetration + rew_dont_wait + rew_stand_still
             + rew_max_height + rew_torso_orientation_l2 + rew_height_progress
             + rew_heading_error + rew_feet_air_time + rew_feet_slide + rew_energy + rew_torque_limits
             + rew_undesired_contacts + rew_dof_vel_limits + rew_dof_vel_l2
-            + rew_is_alive + rew_feet_close_xy
+            + rew_is_alive + rew_feet_close_xy + rew_same_step_penalty
+            + rew_both_feet_air + rew_trailing_foot_drag + rew_lead_alternation + rew_repeat_lead_penalty
         )
+        reward_log["rew_both_feet_air"] = rew_both_feet_air.mean()
+        reward_log["diag_both_feet_air_fraction"] = both_feet_in_air.float().mean()
+        reward_log["rew_same_step_penalty"] = rew_same_step_penalty.mean()
+        reward_log["diag_same_step_fraction"] = same_step_active.float().mean()
+        reward_log["rew_trailing_foot_drag"] = rew_trailing_foot_drag.mean()
+        reward_log["rew_lead_alternation"] = rew_lead_alternation.mean()
+        reward_log["rew_repeat_lead_penalty"] = rew_repeat_lead_penalty.mean()
+        reward_log["diag_repeat_lead_fraction"] = repeat_lead_active.float().mean()
+        reward_log["diag_alternated_step_fraction"] = alternated_step_active.float().mean()
         reward_log["rew_is_alive"] = rew_is_alive.mean()
         reward_log["rew_feet_close_xy"] = rew_feet_close_xy.mean()
         reward_log["diag_mean_feet_distance_y"] = feet_distance_y.mean()
@@ -1071,6 +1469,14 @@ class G1StairsEnv(DirectRLEnv):
         self._episode_start_root_z[env_ids] = root_state[:, 2]
         self._episode_max_climb[env_ids] = 0.0
         self._episode_reached_goal[env_ids] = False
+        self._last_lead_foot[env_ids] = -1
+        self._last_stair_lead_foot[env_ids] = -1
+        self._max_stair_idx_reached[env_ids] = -1
+        self._stair_step_repeated_lead[env_ids] = False
+        self._lead_foot_duration[env_ids] = 0.0
+        self._foot_planted_stair_idx[env_ids] = -1
+        self._prev_feet_air_time[env_ids] = 0.0
+        self._inplace_step_latched[env_ids] = False
         self._resample_commands(env_ids)
         self._update_position_based_commands()
 
@@ -1178,8 +1584,10 @@ class G1StairsEnv(DirectRLEnv):
         root_state[:, 10:13] = quat_apply(delta_yaw_quat, clip_ang_vel)
         dof_pos = self.robot.data.default_joint_pos[env_ids].clone()
         dof_vel = self.robot.data.default_joint_vel[env_ids].clone()
-        dof_pos[:, self.action_dof_indexes] = dof_positions[:, self.motion_dof_indexes]
-        dof_vel[:, self.action_dof_indexes] = dof_velocities[:, self.motion_dof_indexes]
+        # Only overwrite non-excluded (leg + waist) joints from the reference clip; the 14 arm
+        # joints in the clip are frozen at 0 (zombie pose), so keep them at default_joint_pos.
+        dof_pos[:, self.amp_dof_indexes] = dof_positions[:, self.motion_amp_dof_indexes]
+        dof_vel[:, self.amp_dof_indexes] = dof_velocities[:, self.motion_amp_dof_indexes]
 
         amp_observations = self.collect_reference_motions(num_samples, times)
         self.amp_observation_buffer[env_ids] = amp_observations.view(num_samples, self.cfg.num_amp_observations, -1)
@@ -1301,7 +1709,7 @@ def compute_rewards(
     prev_actions: torch.Tensor,
     projected_gravity_b: torch.Tensor,
     all_joint_acc: torch.Tensor,
-    hip_knee_ankle_applied_torque: torch.Tensor,
+    all_applied_torque: torch.Tensor,
     ankle_joint_pos: torch.Tensor,
     ankle_soft_joint_pos_limits: torch.Tensor,
     hip_deviation: torch.Tensor,
@@ -1322,14 +1730,16 @@ def compute_rewards(
     rew_joint_pos_limits = rew_scale_joint_pos_limits * torch.sum(out_of_limits, dim=1)
 
     rew_joint_acc_l2 = rew_scale_joint_acc_l2 * torch.sum(torch.square(all_joint_acc), dim=1)
-    rew_dof_torques_l2 = rew_scale_dof_torques_l2 * torch.sum(torch.square(hip_knee_ankle_applied_torque), dim=1)
+    rew_dof_torques_l2 = rew_scale_dof_torques_l2 * torch.sum(torch.square(all_applied_torque), dim=1)
     rew_flat_orientation_l2 = rew_scale_flat_orientation_l2 * torch.sum(
         torch.square(projected_gravity_b[:, :2]), dim=1
     )
     rew_lin_vel_z_l2 = rew_scale_lin_vel_z_l2 * torch.square(root_lin_vel_b[:, 2])
     rew_ang_vel_xy_l2 = rew_scale_ang_vel_xy_l2 * torch.sum(torch.square(root_ang_vel_b[:, :2]), dim=1)
     rew_joint_deviation_hip = rew_scale_joint_deviation_hip * torch.sum(torch.square(hip_deviation), dim=1)
-    rew_joint_deviation_arms = rew_scale_joint_deviation_arms * torch.sum(torch.abs(arm_deviation), dim=1)
+    rew_joint_deviation_arms = rew_scale_joint_deviation_arms * torch.sum(
+        torch.abs(arm_deviation) + torch.square(arm_deviation), dim=1
+    )
     rew_joint_deviation_torso = rew_scale_joint_deviation_torso * torch.sum(torch.abs(torso_deviation), dim=1)
 
     total_reward = (

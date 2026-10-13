@@ -116,6 +116,22 @@ _G1_29DOF_SOFT_ARMS_CFG.actuators["arms"].damping = 10.0
 _G1_29DOF_SOFT_ARMS_CFG.actuators["waist"].stiffness = 200.0
 _G1_29DOF_SOFT_ARMS_CFG.actuators["waist"].damping = 5.0
 _G1_29DOF_SOFT_ARMS_CFG.spawn.activate_contact_sensors = True
+# Set natural relaxed arm posture in default_joint_pos (matching Isaac Lab's G1_CFG).
+# Stock G1_29DOF_CFG omits the arm joints from init_state.joint_pos, leaving elbow_joint = 0.0
+# which points the forearms 90 deg straight out horizontally ("zombie pose").
+_G1_29DOF_SOFT_ARMS_CFG.init_state.joint_pos.update(
+    {
+        ".*_shoulder_pitch_joint": 0.3,
+        "left_shoulder_roll_joint": 0.25,
+        "right_shoulder_roll_joint": -0.25,
+        ".*_shoulder_yaw_joint": 0.0,
+        ".*_elbow_joint": 0.97,
+        "left_wrist_roll_joint": 0.15,
+        "right_wrist_roll_joint": -0.15,
+        ".*_wrist_pitch_joint": 0.0,
+        ".*_wrist_yaw_joint": 0.0,
+    }
+)
 
 # Self-collision OFF, matching the 2026-09-22 winning run.
 #
@@ -185,24 +201,18 @@ class G1StairsEnvCfg(DirectRLEnvCfg):
     # so that term IS the torso) AND `pelvis_orientation_l2` (weight -3.0, an explicit
     # link_orientation on "pelvis"). This project's asset is pelvis-rooted, so `rew_flat_orientation_l2`
     # above already covers the pelvis; this term adds back the torso coverage InstinctLab has and
-    # we were missing. `rew_joint_deviation_torso` (-0.004) only penalizes the waist JOINTS leaving
-    # their default angle -- ~750x weaker, and blind to a torso that is non-vertical in the world
-    # because the pelvis itself pitched. Same class of port gap as the torso_link vs pelvis
-    # contact-termination bug: InstinctLab's term lands on "torso" only because its robot is
-    # torso-rooted. Same formula as flat_orientation (squared xy of gravity projected into the
-    # link frame); see _get_rewards.
-    rew_torso_orientation_l2 = -3.0
+    # we were missing. Relaxed from -3.0 to -1.5 so the torso can lean slightly forward (~8-12 deg)
+    # during steep stair step-ups while the pelvis stays level.
+    rew_torso_orientation_l2 = -1.5
     rew_lin_vel_z_l2 = -0.2
     rew_ang_vel_xy_l2 = -0.05
-    rew_joint_deviation_hip = -0.5
-    # Raised from -0.004 (InstinctLab's value) 2026-09-16. With the arms dropped from the AMP
-    # observation, this is now the ONLY term governing arm posture -- the discriminator no longer
-    # has an opinion about them at all. At -0.004 a fully contorted arm (~2 rad of summed
-    # deviation) cost ~0.008/step against a ~4.7/step total reward: nothing. -0.05 makes that same
-    # pose cost ~0.1/step -- enough to pull the arms back toward default without dominating.
-    # Judgment call on the magnitude, not a measured optimum; watch rew_joint_deviation_arms and
-    # the rendered arm pose on the next run and retune if the arms go stiff or stay loose.
-    rew_joint_deviation_arms = -0.05
+    rew_joint_deviation_hip = -0.8
+    # Raised from -0.05 to -0.30 (with L1 + L2 penalty in compute_rewards) and paired with a
+    # natural relaxed default arm pose in _G1_29DOF_SOFT_ARMS_CFG. At -0.05 L1, the policy
+    # tolerated ~7.5 rad of total arm deviation (~0.54 rad/joint) for only -0.38/step penalty.
+    # At -0.30 (L1 + L2), wild arm flailing is strongly penalized while keeping the arms tucked
+    # cleanly near the natural default hang.
+    rew_joint_deviation_arms = -0.30
     rew_joint_deviation_torso = -0.004
 
     # Positive weight but still a penalty: the formula is exp(-clamp(thr - dy, 0)/std^2) - 1,
@@ -246,7 +256,27 @@ class G1StairsEnvCfg(DirectRLEnvCfg):
     rew_edge_penetration = -4.0
     edge_safety_margin_m = 0.05
 
-    # --- Volume-point edge penalty (ablation arm; OFF by default) ---------------------------
+    # Hard anti-jump / no-flight penalty: penalizes having both feet off the ground simultaneously
+    # so the policy must always maintain single or double support (true walking, never hopping).
+    rew_both_feet_air = -4.0
+
+    # Penalty when both feet land or stand on the same stair tread (double-stepping / shuffling)
+    # or when a foot lifts and re-lands in-place on the same stair tread.
+    rew_same_step_penalty = -0.75
+
+    # Strictly monotonic step-over-step lead-leg alternation reward (scoped to new stairs only)
+    # and repeat-lead swing penalty.
+    rew_lead_alternation = 8.0
+    rew_repeat_lead_penalty = -0.35
+    lead_foot_margin_m = 0.08
+    repeat_lead_climb_scale = 0.35
+
+    # Trailing-foot drag penalty: penalizes a swing foot in single support whose sole volume points
+    # scrape through the stair-edge cylinder at or below the step lip while moving forward.
+    rew_trailing_foot_drag = -0.5
+    swing_edge_lip_margin_m = 0.02
+
+    # --- Volume-point edge penalty (ablation arm; ENABLED by default) ---------------------------
     # Higher-fidelity replacement for `rew_edge_penetration` above, following InstinctLab's
     # `volume_points_penetration`. The term above models each foot as ONE point (the ankle body
     # origin) and measures only planar distance to a riser line, so it cannot tell a foot resting
@@ -257,29 +287,31 @@ class G1StairsEnvCfg(DirectRLEnvCfg):
     #
     # Exclusive with `rew_edge_penetration`: whichever is selected is the only edge term applied,
     # so the two never double-count. Flip this flag to switch ablation arms.
-    use_volume_points_edge_penalty: bool = False
+    use_volume_points_edge_penalty: bool = True
     rew_volume_points_penetration = -4.0  # same weight InstinctLab gives the term it ports from
 
-    # Foot-local sample grid, in the `*_ankle_roll_link` frame. Extents are InstinctLab's, which
-    # transfer directly here because both projects drive the same G1 29-DOF asset and the same
-    # ankle_roll_link body -- unlike the torso_link/pelvis mismatch that broke the contact
-    # termination, this link means the same thing on both robots. x spans heel (-2.5 cm) to toe
-    # (+12 cm), y the 6 cm width, z the 4 cm sole depth below the ankle frame.
-    volume_points_x_range_m = (-0.025, 0.12)
-    volume_points_y_range_m = (-0.03, 0.03)
-    volume_points_z_range_m = (-0.04, 0.0)
+    # Foot-local sample grid, in the `*_ankle_roll_link` frame, matched to the exact CAD bounds of
+    # `left_ankle_roll_link.STL` (x: [-0.0658, +0.1424] m = 20.82 cm length; y: [-0.0377, +0.0378] m
+    # = 7.56 cm width; z_bottom = -0.0354 m). The original (-0.025, 0.12) range missed the back
+    # 4.08 cm of the heel and the front 2.24 cm of the toe.
+    volume_points_x_range_m = (-0.066, 0.142)
+    volume_points_y_range_m = (-0.038, 0.038)
+    volume_points_z_range_m = (-0.035, 0.0)
     volume_points_grid = (10, 5, 2)  # -> 100 points per foot, 200 per robot
 
-    # Radius of the virtual cylinder wrapped around each stair edge. InstinctLab detects edges by
-    # scanning the terrain mesh (DBSCAN + RANSAC over Canny-detected depth/normal edges) because
-    # its terrains are arbitrary; this project generates its own stairs, so the edges are known in
-    # closed form and no detection is needed -- see _stair_edge_penetration_depth.
-    edge_cylinder_radius_m = 0.05
+    # Radius of the virtual cylinder wrapped around each stair edge, plus monotonic tread-containment
+    # margins for heel overhang and toe-to-riser clearance. Because the true G1 foot is 20.82 cm long
+    # on a 27.94 cm tread (7.12 cm total spare clearance), 2.5 cm margins on each end leave a 2.12 cm
+    # zero-penalty sweet spot for the ankle at ~9.1-11.2 cm into the tread.
+    edge_cylinder_radius_m = 0.035
+    heel_overhang_margin_m = 0.025
+    toe_riser_margin_m = 0.025
+    edge_penalty_curriculum_max_scale = 2.5
 
     rew_dont_wait = -0.5
-    dont_wait_cmd_threshold_mps = 0.3
-    rew_stand_still = -0.3
-    stand_still_offset = 4.0
+    dont_wait_cmd_threshold_mps = 0.20
+    rew_stand_still = -0.5
+    stand_still_offset = 0.5
     stand_still_cmd_threshold = 0.15
 
     # Instantaneous height-above-goal term (root_z - platform_z). Left OFF (0.0): it rewards being
@@ -379,9 +411,12 @@ class G1StairsEnvCfg(DirectRLEnvCfg):
         ),
     )
 
-    command_pos_k_v = 2.0
+    # Lowered from k_v=2.0, v_x_max=0.8 m/s to k_v=1.0, v_x_max=0.45 m/s to match the reference
+    # climbing gait in G1_parkour_climb.npz (mean horizontal speed 0.45 m/s, ~1.4 steps/s) and
+    # decelerate smoothly into the top platform instead of sprinting at ~2.9 steps/s.
+    command_pos_k_v = 1.0
     command_pos_k_w = 2.0
-    command_lin_vel_x_max = 0.8
+    command_lin_vel_x_max = 0.45
     command_ang_vel_z_max = 1.0
     command_target_dist_threshold_m = 0.4
     command_resample_time_s = 20.0
