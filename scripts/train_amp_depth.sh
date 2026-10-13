@@ -13,12 +13,13 @@ set -euo pipefail
 
 TASK="${TASK:-Isaac-G1-AMP-Stairs-Direct-v0}"
 NUM_ENVS="${NUM_ENVS:-4096}"
+EXTRA_ARGS="${*:-}"
 
 mkdir -p "$(pwd)/logs"
 
 docker run --rm --gpus all \
   -e ACCEPT_EULA=Y \
-  -e TASK="${TASK}" -e NUM_ENVS="${NUM_ENVS}" \
+  -e TASK="${TASK}" -e NUM_ENVS="${NUM_ENVS}" -e EXTRA_ARGS="${EXTRA_ARGS}" \
   -v "$(pwd)/isaaclab_project:/workspace/rl_wbc_g1/isaaclab_project" \
   -v "$(pwd)/scripts:/workspace/rl_wbc_g1/scripts" \
   -v "$(pwd)/logs:/workspace/isaaclab_root/logs" \
@@ -27,5 +28,5 @@ docker run --rm --gpus all \
     set -euo pipefail
     cd /workspace/isaaclab_root
     ./isaaclab.sh -p /workspace/rl_wbc_g1/scripts/train_amp_depth.py \
-      --task "${TASK}" --headless --num_envs "${NUM_ENVS}"
+      --task "${TASK}" --headless --num_envs "${NUM_ENVS}" ${EXTRA_ARGS}
   '
